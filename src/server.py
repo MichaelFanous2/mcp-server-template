@@ -2,6 +2,7 @@
 import os
 import base64
 import requests
+from pathlib import Path
 
 from fastmcp import FastMCP
 from starlette.requests import Request
@@ -40,10 +41,11 @@ mcp = FastMCP("Twilio MCP")
 
 
 # ======================
-# IN-MEMORY AUDIO CACHE
+# AUDIO STORAGE (DURABLE)
 # ======================
 
-AUDIO_CACHE = {}  # CallSid -> base64 mp3
+AUDIO_DIR = Path("/tmp/elevenlabs_audio")
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ======================
@@ -71,7 +73,11 @@ def poke_reply(user_text: str) -> str:
     raise RuntimeError(f"Unexpected Poke response: {data}")
 
 
-def elevenlabs_tts(text: str) -> str:
+def elevenlabs_tts_to_mp3(text: str, call_sid: str) -> Path:
+    """
+    Generates ElevenLabs audio and writes it to disk.
+    Returns the file path. Raises if anything fails.
+    """
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
     payload = {
         "text": text,
@@ -89,9 +95,13 @@ def elevenlabs_tts(text: str) -> str:
 
     resp = requests.post(url, json=payload, headers=headers, timeout=60)
     if resp.status_code != 200:
-        raise RuntimeError(resp.text)
+        raise RuntimeError(f"ElevenLabs error {resp.status_code}: {resp.text}")
 
-    return base64.b64encode(resp.content).decode("utf-8")
+    audio_path = AUDIO_DIR / f"{call_sid}.mp3"
+    with open(audio_path, "wb") as f:
+        f.write(resp.content)
+
+    return audio_path
 
 
 # ======================
@@ -108,20 +118,7 @@ def send_sms(to: str, body: str) -> str:
     return f"SMS sent ({msg.sid})"
 
 
-@mcp.tool(description="Make a static phone call via Twilio")
-def make_call(to: str, message: str) -> str:
-    vr = VoiceResponse()
-    vr.say(message, voice="alice")
-
-    call = twilio.calls.create(
-        to=to,
-        from_=TWILIO_PHONE_NUMBER,
-        twiml=str(vr),
-    )
-    return f"Call started ({call.sid})"
-
-
-@mcp.tool(description="Start an interactive AI phone call (Twilio + Poke + ElevenLabs)")
+@mcp.tool(description="Start an interactive AI phone call (Twilio + Poke + ElevenLabs ONLY)")
 def start_agent_call(to: str, greeting: str = "Hey, how can I help?") -> str:
     url = f"{PUBLIC_BASE_URL}/twilio/voice?greeting={requests.utils.quote(greeting)}"
     call = twilio.calls.create(
@@ -142,15 +139,17 @@ async def twilio_voice(request: Request):
     greeting = request.query_params.get("greeting") or "Hey, how can I help?"
 
     vr = VoiceResponse()
-    vr.say(greeting, voice="alice")
 
+    # IMPORTANT: no Twilio <Say> for normal flow.
+    # We only gather speech here.
     gather = Gather(
         input="speech",
         action=f"{PUBLIC_BASE_URL}/twilio/voice/handle",
         method="POST",
+        barge_in=True,
         speech_timeout="auto",
     )
-    gather.say("Tell me what you need.", voice="alice")
+    gather.say(greeting, voice="alice")  # greeting only; conversation uses ElevenLabs
     vr.append(gather)
 
     vr.redirect(f"{PUBLIC_BASE_URL}/twilio/voice", method="GET")
@@ -165,24 +164,37 @@ async def twilio_voice_handle(request: Request):
 
     vr = VoiceResponse()
 
+    if not call_sid:
+        # Hard fail: never fall back to Twilio voice
+        raise RuntimeError("Missing CallSid; refusing to use Twilio TTS")
+
     if not user_text:
-        vr.say("I did not catch that. Can you repeat?", voice="alice")
-        vr.redirect(f"{PUBLIC_BASE_URL}/twilio/voice", method="GET")
+        # Re-prompt, but still no Alice conversation
+        gather = Gather(
+            input="speech",
+            action=f"{PUBLIC_BASE_URL}/twilio/voice/handle",
+            method="POST",
+            barge_in=True,
+            speech_timeout="auto",
+        )
+        vr.append(gather)
         return PlainTextResponse(str(vr), media_type="text/xml")
 
+    # 1) User speech -> Poke
     reply = poke_reply(user_text)
-    audio_b64 = elevenlabs_tts(reply)
 
-    if call_sid:
-        AUDIO_CACHE[call_sid] = audio_b64
-        vr.play(f"{PUBLIC_BASE_URL}/twilio/audio/{call_sid}")
-    else:
-        vr.say(reply, voice="alice")
+    # 2) Poke reply -> ElevenLabs (durable audio)
+    audio_path = elevenlabs_tts_to_mp3(reply, call_sid)
 
+    # 3) Twilio plays ElevenLabs audio (no fallback)
+    vr.play(f"{PUBLIC_BASE_URL}/twilio/audio/{call_sid}")
+
+    # 4) Continue the loop
     gather = Gather(
         input="speech",
         action=f"{PUBLIC_BASE_URL}/twilio/voice/handle",
         method="POST",
+        barge_in=True,
         speech_timeout="auto",
     )
     vr.append(gather)
@@ -193,13 +205,15 @@ async def twilio_voice_handle(request: Request):
 @mcp.custom_route("/twilio/audio/{call_sid}", methods=["GET"])
 async def twilio_audio(request: Request):
     call_sid = request.path_params.get("call_sid")
-    b64 = AUDIO_CACHE.get(call_sid)
+    audio_path = AUDIO_DIR / f"{call_sid}.mp3"
 
-    if not b64:
-        return PlainTextResponse("not found", status_code=404)
+    if not audio_path.exists():
+        # If this 404s, Twilio will not speak at all.
+        # That is intentional. No Alice fallback.
+        return PlainTextResponse("audio not found", status_code=404)
 
-    audio_bytes = base64.b64decode(b64.encode("utf-8"))
-    return Response(audio_bytes, media_type="audio/mpeg")
+    with open(audio_path, "rb") as f:
+        return Response(f.read(), media_type="audio/mpeg")
 
 
 # ======================
