@@ -69,6 +69,17 @@ def write_audio(call_sid: str, turn_id: str, audio: bytes) -> Path:
 
 
 # =========================
+# GREETING (topic-aware, zero latency)
+# =========================
+def greeting_for_topic(topic: str) -> str:
+    topic = (topic or "").strip()
+    if not topic:
+        return "Hey. Go ahead."
+
+    return f"Hey. Let’s talk about {topic}. Go ahead."
+
+
+# =========================
 # OPENAI (text only, latency-biased)
 # =========================
 def openai_generate(call_sid: str, user_text: str) -> str:
@@ -77,7 +88,7 @@ def openai_generate(call_sid: str, user_text: str) -> str:
     history: List[Tuple[str, str]] = ctx["history"]
 
     transcript = ""
-    for role, text in history[-6:]:  # keep context short
+    for role, text in history[-6:]:
         transcript += f"{role.upper()}: {text}\n"
 
     instructions = (
@@ -97,7 +108,6 @@ def openai_generate(call_sid: str, user_text: str) -> str:
         "temperature": 0.9,
     }
 
-    log(f"[CALL {call_sid}] OPENAI REQUEST")
     resp = requests.post(
         "https://api.openai.com/v1/responses",
         headers={
@@ -112,7 +122,6 @@ def openai_generate(call_sid: str, user_text: str) -> str:
     data = resp.json()
 
     text = data["output"][0]["content"][0]["text"].strip()
-
     if text and not text.endswith((".", "!", "?")):
         text += "."
 
@@ -162,10 +171,7 @@ def send_sms(to: str, body: str) -> str:
 
 @mcp.tool(description="Start an AI phone call")
 def start_agent_call(to: str, topic: str) -> str:
-    log("STARTING CALL")
-
     pending_id = str(int(now() * 1000))
-    greeting_text = "Hey. Go ahead."
 
     CALL_CONTEXT[f"PENDING:{pending_id}"] = {
         "topic": topic,
@@ -213,7 +219,8 @@ async def twilio_audio_pending(request: Request):
     if not ctx:
         return PlainTextResponse("not found", status_code=404)
 
-    audio = elevenlabs_tts("Hey. Go ahead.")
+    greeting_text = greeting_for_topic(ctx.get("topic"))
+    audio = elevenlabs_tts(greeting_text)
     return Response(audio, media_type="audio/mpeg")
 
 
