@@ -21,3 +21,7 @@ services:
         value: "sat,sun"
       - key: KALSHI_SCHEDULE_HOURS
         value: "9-21"
+      - key: PARALLEL_MONITOR_INTERVAL
+        value: "300"
+      - key: PARALLEL_MONITOR_ENABLED
+        value: "true"

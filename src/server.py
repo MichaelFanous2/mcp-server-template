@@ -3,6 +3,7 @@ import os
 import time
 import json
 import base64
+import logging
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
@@ -44,6 +45,10 @@ KALSHI_INSIGHTS_ENABLED = os.environ.get("KALSHI_INSIGHTS_ENABLED", "true").lowe
 KALSHI_SCHEDULE_DAYS = os.environ.get("KALSHI_SCHEDULE_DAYS", "sat,sun")
 KALSHI_SCHEDULE_HOURS = os.environ.get("KALSHI_SCHEDULE_HOURS", "9-21")
 
+PARALLEL_API_KEY = os.environ.get("PARALLEL_API_KEY")
+PARALLEL_MONITOR_INTERVAL = int(os.environ.get("PARALLEL_MONITOR_INTERVAL", "300"))
+PARALLEL_MONITOR_ENABLED = os.environ.get("PARALLEL_MONITOR_ENABLED", "true").lower() == "true"
+
 
 # =========================
 # CLIENTS / SERVER
@@ -56,10 +61,19 @@ class KalshiAPI:
     def __init__(self, api_key_id: str, private_key_pem: str, host: str):
         self.api_key_id = api_key_id
         self.host = host.rstrip("/")
-        self.private_key = serialization.load_pem_private_key(
-            private_key_pem.encode() if isinstance(private_key_pem, str) else private_key_pem,
-            password=None
-        )
+        
+        if isinstance(private_key_pem, str):
+            private_key_pem = private_key_pem.replace("\\n", "\n")
+            if not private_key_pem.startswith("-----BEGIN"):
+                raise ValueError("Private key must be in PEM format starting with -----BEGIN RSA PRIVATE KEY-----")
+        
+        try:
+            self.private_key = serialization.load_pem_private_key(
+                private_key_pem.encode() if isinstance(private_key_pem, str) else private_key_pem,
+                password=None
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to load private key: {str(e)}. Make sure the key is properly formatted with newlines.")
         self.session = requests.Session()
         self.padding = padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH)
     
@@ -99,8 +113,10 @@ class KalshiAPI:
         
         body = json.dumps(json_data) if json_data else None
         headers = {"Content-Type": "application/json", **self._sign_request(method, path, body)}
+        logger.info(f"[API CALL] Kalshi API - {method} {path}, params: {params}")
         response = self.session.request(method, f"{self.host}{path}", headers=headers, params=params, json=json_data, timeout=30)
         response.raise_for_status()
+        logger.info(f"[API CALL] Kalshi API response - {method} {path} - Status: {response.status_code}")
         return response.json()
     
     def get_markets(self, limit: int = 100, **kwargs) -> Dict[str, Any]:
@@ -122,6 +138,12 @@ if KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY:
 
 scheduler = BackgroundScheduler()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 
 # =========================
 # STATE
@@ -139,6 +161,10 @@ KALSHI_PRICE_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
 KALSHI_VOLUME_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
 KALSHI_RATE_LIMIT_QUEUE: List[float] = []
 KALSHI_RATE_LIMIT = 20
+
+PARALLEL_MONITORS: Dict[str, Dict[str, Any]] = {}
+PARALLEL_MONITORS_FILE = Path("/tmp/parallel_monitors.json")
+PARALLEL_ALERTS: List[Dict[str, Any]] = []
 
 
 # =========================
@@ -219,6 +245,7 @@ Yes Asks: {len(yes_asks)}
     }
     
     try:
+        logger.info(f"[API CALL] OpenAI generate_market_insights - ticker: '{ticker}', mid_price: {mid_price}")
         resp = requests.post(
             "https://api.openai.com/v1/responses",
             headers={
@@ -480,6 +507,558 @@ def analyze_volume_shifts(ticker: str) -> Dict[str, Any]:
 load_kalshi_watches()
 
 
+class ParallelAPI:
+    """Parallel AI Extract and Search API client."""
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.parallel.ai/v1beta"
+        self.session = requests.Session()
+    
+    def extract(self, urls: List[str], objective: str, excerpts: bool = True, full_content: bool = True) -> Dict[str, Any]:
+        """Extract content from URLs using Parallel API."""
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "parallel-beta": "search-extract-2025-10-10"
+        }
+        
+        payload = {
+            "urls": urls,
+            "objective": objective,
+            "excerpts": excerpts,
+            "full_content": full_content
+        }
+        
+        logger.info(f"[API CALL] Parallel Extract - URLs: {len(urls)}, objective: '{objective[:50]}...'")
+        response = self.session.post(
+            f"{self.base_url}/extract",
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+        response.raise_for_status()
+        logger.info(f"[API CALL] Parallel Extract response - Status: {response.status_code}")
+        return response.json()
+    
+    def search(self, query: str, max_results: int = 5) -> Dict[str, Any]:
+        """Search the web using Parallel API."""
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "parallel-beta": "search-extract-2025-10-10"
+        }
+        
+        payload = {
+            "query": query,
+            "max_results": max_results
+        }
+        
+        logger.info(f"[API CALL] Parallel Search - query: '{query[:50]}...', max_results: {max_results}")
+        response = self.session.post(
+            f"{self.base_url}/search",
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+        response.raise_for_status()
+        logger.info(f"[API CALL] Parallel Search response - Status: {response.status_code}")
+        return response.json()
+
+parallel_api = None
+if PARALLEL_API_KEY:
+    try:
+        parallel_api = ParallelAPI(PARALLEL_API_KEY)
+    except Exception as e:
+        print(f"Warning: Failed to initialize Parallel API: {e}")
+
+
+def load_parallel_monitors():
+    global PARALLEL_MONITORS
+    if PARALLEL_MONITORS_FILE.exists():
+        try:
+            with open(PARALLEL_MONITORS_FILE, "r") as f:
+                PARALLEL_MONITORS = json.load(f)
+        except:
+            PARALLEL_MONITORS = {}
+
+
+def save_parallel_monitors():
+    try:
+        with open(PARALLEL_MONITORS_FILE, "w") as f:
+            json.dump(PARALLEL_MONITORS, f)
+    except:
+        pass
+
+
+def parse_kalshi_calendar_content(content: str) -> List[Dict[str, Any]]:
+    """Parse Kalshi calendar page to extract live game information."""
+    games = []
+    
+    if "LIVE" not in content:
+        return games
+    
+    lines = content.split("\n")
+    current_game = None
+    
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line or line == "* * *" or "© 2025" in line:
+            continue
+        
+        if "LIVE" in line and ("Q" in line or "HALFTIME" in line):
+            if current_game and current_game.get("teams"):
+                games.append(current_game)
+            current_game = {"status": "LIVE", "raw_line": line}
+        
+        if current_game:
+            if any(x in line for x in ["Pro Football", "College Football", "Pro Basketball", "College Basketball"]):
+                parts = line.split()
+                sport_type = None
+                teams = []
+                
+                for j, part in enumerate(parts):
+                    if part in ["Pro", "College"] and j + 1 < len(parts):
+                        sport_type = f"{part} {parts[j+1]}"
+                    elif part.isupper() and len(part) > 1 and part not in ["LIVE", "Q", "HALFTIME"]:
+                        if len(teams) < 2:
+                            teams.append(part)
+                
+                if sport_type:
+                    current_game["sport"] = sport_type
+                if teams:
+                    current_game["teams"] = teams
+            
+            if "%" in line:
+                try:
+                    parts = line.split()
+                    for j, part in enumerate(parts):
+                        if "%" in part:
+                            pct = int(part.replace("%", "").replace("¢", ""))
+                            if j > 0:
+                                prev = parts[j-1].lower()
+                                if prev in ["yes", "no"]:
+                                    current_game[f"{prev}_probability"] = pct
+                except:
+                    pass
+            
+            if "Q" in line or "HALFTIME" in line:
+                if "HALFTIME" in line:
+                    current_game["quarter"] = "HALFTIME"
+                elif "Q" in line:
+                    q_parts = line.split("Q")
+                    if len(q_parts) > 1:
+                        q_num = q_parts[0].split()[-1] if q_parts[0].split() else "?"
+                        time_part = q_parts[1].strip() if len(q_parts) > 1 else ""
+                        current_game["quarter"] = f"Q{q_num}"
+                        if time_part:
+                            current_game["time"] = time_part
+    
+    if current_game and current_game.get("teams"):
+        games.append(current_game)
+    
+    return games
+
+
+def generate_alpha_insight_with_llm(game_info: Dict[str, Any], market_data: Dict[str, Any], orderbook: Dict[str, Any], use_search: bool = True) -> str:
+    """Use OpenAI to generate intelligent alpha insights comparing live game state vs market. Optionally uses Parallel search for context."""
+    if not KALSHI_INSIGHTS_ENABLED or not OPENAI_API_KEY:
+        return ""
+    
+    yes_bids = orderbook.get("yes_bids", [])
+    yes_asks = orderbook.get("yes_asks", [])
+    
+    if not yes_bids or not yes_asks:
+        return ""
+    
+    market_yes_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+    game_yes_prob = game_info.get("yes_probability")
+    
+    if not game_yes_prob:
+        return ""
+    
+    spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
+    bid_depth = sum(b.get("size", 0) for b in yes_bids[:5])
+    ask_depth = sum(a.get("size", 0) for a in yes_asks[:5])
+    
+    teams_str = ", ".join(game_info.get('teams', []))
+    sport = game_info.get('sport', 'Unknown')
+    quarter = game_info.get('quarter', 'Unknown')
+    
+    # Optional: Use Parallel search for additional context
+    search_context = ""
+    if use_search and parallel_api and abs(market_yes_prob - game_yes_prob) > 5:
+        try:
+            search_query = f"{sport} {teams_str} {quarter} live score"
+            logger.info(f"[PARALLEL] Searching for game context: '{search_query}'")
+            search_results = parallel_api.search(search_query, max_results=3)
+            
+            if "results" in search_results and search_results["results"]:
+                search_context = "\n\nAdditional Context from Web Search (Third-Party Source):\n"
+                search_context += "⚠️ IMPORTANT: This is information from a third-party web search API. "
+                search_context += "It may or may not be accurate. Treat it as unbiased context, not verified truth. "
+                search_context += "Evaluate whether you agree or disagree with this information, then provide your analysis.\n\n"
+                
+                for i, result in enumerate(search_results["results"][:3], 1):
+                    title = result.get("title", "No title")
+                    snippet = result.get("snippet", result.get("excerpt", "No content"))
+                    url = result.get("url", "")
+                    search_context += f"{i}. {title}\n"
+                    search_context += f"   {snippet[:200]}...\n"
+                    if url:
+                        search_context += f"   Source: {url}\n"
+                    search_context += "\n"
+        except Exception as e:
+            logger.warning(f"[PARALLEL] Failed to get search context: {e}")
+            search_context = ""
+    
+    context = f"""
+Live Game State (from Kalshi calendar):
+- Teams: {teams_str}
+- Sport: {sport}
+- Quarter/Status: {quarter}
+- Calendar Probability: {game_yes_prob}% Yes
+
+Market Data (from Kalshi API):
+- Market: {market_data.get('title', 'N/A')}
+- Market Price: {market_yes_prob:.1f}% Yes
+- Spread: {spread:.1f} cents
+- Bid Depth (top 5): {bid_depth} contracts
+- Ask Depth (top 5): {ask_depth} contracts
+
+Difference: {abs(market_yes_prob - game_yes_prob):.1f} percentage points
+{search_context}
+"""
+    
+    instructions = (
+        "You are a sports betting analyst. Analyze the discrepancy between the live game state "
+        "and the market price. Consider: game momentum (which quarter, score if available), "
+        "market liquidity (spread, depth), and whether the market is mispricing based on current game state. "
+    )
+    
+    if search_context:
+        instructions += (
+            "\nIMPORTANT: If web search results are provided above, they come from a third-party search API. "
+            "This information may or may not be true. Do not blindly accept it as fact. "
+            "Treat it as unbiased context - evaluate whether you agree or disagree with the information, "
+            "then provide your analysis based on all available information. Be clear about what you're using "
+            "from the search results vs. what you're inferring from the market data."
+        )
+    
+    instructions += (
+        "\nProvide a brief, actionable insight (2-3 sentences max) on whether this represents alpha. "
+        "Be specific about why the market might be wrong."
+    )
+    
+    payload = {
+        "model": "gpt-4.1-mini",
+        "instructions": instructions,
+        "input": f"Analyze this betting opportunity:\n{context}\n\nIs there alpha here? Explain:",
+        "max_output_tokens": 200,
+        "temperature": 0.7,
+    }
+    
+    try:
+        logger.info(f"[API CALL] OpenAI generate_alpha_insight - game: {teams_str}, market_prob: {market_yes_prob:.1f}%, game_prob: {game_yes_prob}%, use_search: {use_search}")
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        insight = data["output"][0]["content"][0]["text"].strip()
+        return f"💡 ALPHA: {insight}"
+    except Exception as e:
+        logger.error(f"[API CALL] Failed to generate LLM alpha insight: {e}")
+        return ""
+
+
+def check_parallel_monitors():
+    """Check all Parallel monitors for updates."""
+    logger.info(f"[PARALLEL] check_parallel_monitors called - {len(PARALLEL_MONITORS)} active monitors")
+    if not parallel_api or not PARALLEL_MONITOR_ENABLED:
+        logger.info("[PARALLEL] Monitoring disabled or API not configured")
+        return
+    
+    for monitor_id, monitor in list(PARALLEL_MONITORS.items()):
+        try:
+            urls = monitor.get("urls", [])
+            objective = monitor.get("objective", "")
+            
+            if not urls:
+                logger.warning(f"[PARALLEL] Monitor {monitor_id} has no URLs")
+                continue
+            
+            logger.info(f"[PARALLEL] Checking monitor '{monitor.get('name', monitor_id)}' - {len(urls)} URL(s)")
+            result = parallel_api.extract(urls, objective, excerpts=True, full_content=True)
+            
+            if "results" in result and result["results"]:
+                content = result["results"][0].get("full_content", "")
+                previous_content = monitor.get("last_content", "")
+                
+                if content != previous_content or monitor.get("check_count", 0) == 0:
+                    monitor["last_content"] = content
+                    monitor["last_check"] = datetime.now().isoformat()
+                    monitor["check_count"] = monitor.get("check_count", 0) + 1
+                    save_parallel_monitors()
+                    
+                    alert_msg = f"🔄 Parallel Monitor: {monitor.get('name', monitor_id)}\n"
+                    
+                    if monitor.get("type") == "kalshi_calendar":
+                        games = parse_kalshi_calendar_content(content)
+                        if games:
+                            alert_msg += f"\n🎮 {len(games)} Live Games Detected:\n\n"
+                            
+                            for game in games[:10]:
+                                teams_str = " vs ".join(game.get("teams", ["Unknown"]))
+                                sport = game.get("sport", "Unknown Sport")
+                                quarter = game.get("quarter", "Unknown")
+                                
+                                alert_msg += f"  {sport}: {teams_str}\n"
+                                alert_msg += f"    Status: {quarter}"
+                                if game.get("time"):
+                                    alert_msg += f" - {game['time']}"
+                                alert_msg += "\n"
+                                
+                                yes_prob = game.get("yes_probability")
+                                no_prob = game.get("no_probability")
+                                if yes_prob or no_prob:
+                                    alert_msg += f"    Kalshi Calendar Shows: "
+                                    if yes_prob:
+                                        alert_msg += f"Yes {yes_prob}%"
+                                    if yes_prob and no_prob:
+                                        alert_msg += " | "
+                                    if no_prob:
+                                        alert_msg += f"No {no_prob}%"
+                                    alert_msg += "\n"
+                                
+                                if game.get("teams") and kalshi_api:
+                                    try:
+                                        search_query = " ".join(game.get("teams", [])[:2])
+                                        markets_resp = kalshi_api.get_markets(limit=20)
+                                        markets = markets_resp.get("markets", [])
+                                        markets = filter_active_markets(markets)
+                                        
+                                        matching_markets = [
+                                            m for m in markets
+                                            if any(team.lower() in (m.get("title") or "").lower() for team in game.get("teams", []))
+                                        ]
+                                        
+                                        if matching_markets:
+                                            market = matching_markets[0]
+                                            ticker = market.get("ticker")
+                                            orderbook = kalshi_api.get_orderbook(ticker)
+                                            
+                                            alpha = generate_alpha_insight_with_llm(game, market, orderbook, use_search=True)
+                                            if alpha:
+                                                alert_msg += f"    {alpha}\n"
+                                            else:
+                                                yes_bids = orderbook.get("yes_bids", [])
+                                                yes_asks = orderbook.get("yes_asks", [])
+                                                if yes_bids and yes_asks:
+                                                    market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+                                                    alert_msg += f"    Market Price: {market_prob:.0f}% (ticker: {ticker})\n"
+                                    except Exception as e:
+                                        logger.warning(f"[PARALLEL] Failed to compare game with market: {e}")
+                                
+                                alert_msg += "\n"
+                    
+                    PARALLEL_ALERTS.append({
+                        "monitor_id": monitor_id,
+                        "timestamp": datetime.now().isoformat(),
+                        "message": alert_msg,
+                        "content_preview": content[:500]
+                    })
+                    
+                    logger.info(f"[PARALLEL ALERT] Monitor '{monitor.get('name', monitor_id)}' triggered alert")
+                    print(f"[PARALLEL ALERT] {alert_msg}")
+        except Exception as e:
+            logger.error(f"[PARALLEL ERROR] Failed to check monitor {monitor_id}: {e}")
+            print(f"[PARALLEL ERROR] Failed to check monitor {monitor_id}: {e}")
+
+
+load_parallel_monitors()
+
+
+def check_single_parallel_monitor(monitor_id: str):
+    """Check a single Parallel monitor. Used for per-monitor scheduling."""
+    if monitor_id not in PARALLEL_MONITORS:
+        logger.warning(f"[PARALLEL] Monitor {monitor_id} no longer exists, removing from scheduler")
+        try:
+            scheduler.remove_job(f"parallel_monitor_{monitor_id}")
+        except:
+            pass
+        return
+    
+    monitor = PARALLEL_MONITORS[monitor_id]
+    if not parallel_api or not PARALLEL_MONITOR_ENABLED:
+        return
+    
+    try:
+        urls = monitor.get("urls", [])
+        objective = monitor.get("objective", "")
+        
+        if not urls:
+            logger.warning(f"[PARALLEL] Monitor {monitor_id} has no URLs")
+            return
+        
+        logger.info(f"[PARALLEL] Checking monitor '{monitor.get('name', monitor_id)}' - {len(urls)} URL(s)")
+        result = parallel_api.extract(urls, objective, excerpts=True, full_content=True)
+        
+        if "results" in result and result["results"]:
+            content = result["results"][0].get("full_content", "")
+            previous_content = monitor.get("last_content", "")
+            
+            if content != previous_content or monitor.get("check_count", 0) == 0:
+                monitor["last_content"] = content
+                monitor["last_check"] = datetime.now().isoformat()
+                monitor["check_count"] = monitor.get("check_count", 0) + 1
+                save_parallel_monitors()
+                
+                alert_msg = f"🔄 Parallel Monitor: {monitor.get('name', monitor_id)}\n"
+                
+                if monitor.get("type") == "kalshi_calendar":
+                    games = parse_kalshi_calendar_content(content)
+                    if games:
+                        alert_msg += f"\n🎮 {len(games)} Live Games Detected:\n\n"
+                        
+                        for game in games[:10]:
+                            teams_str = " vs ".join(game.get("teams", ["Unknown"]))
+                            sport = game.get("sport", "Unknown Sport")
+                            quarter = game.get("quarter", "Unknown")
+                            
+                            alert_msg += f"  {sport}: {teams_str}\n"
+                            alert_msg += f"    Status: {quarter}"
+                            if game.get("time"):
+                                alert_msg += f" - {game['time']}"
+                            alert_msg += "\n"
+                            
+                            yes_prob = game.get("yes_probability")
+                            no_prob = game.get("no_probability")
+                            if yes_prob or no_prob:
+                                alert_msg += f"    Kalshi Calendar Shows: "
+                                if yes_prob:
+                                    alert_msg += f"Yes {yes_prob}%"
+                                if yes_prob and no_prob:
+                                    alert_msg += " | "
+                                if no_prob:
+                                    alert_msg += f"No {no_prob}%"
+                                alert_msg += "\n"
+                            
+                            if game.get("teams") and kalshi_api:
+                                try:
+                                    search_query = " ".join(game.get("teams", [])[:2])
+                                    markets_resp = kalshi_api.get_markets(limit=20)
+                                    markets = markets_resp.get("markets", [])
+                                    markets = filter_active_markets(markets)
+                                    
+                                    matching_markets = [
+                                        m for m in markets
+                                        if any(team.lower() in (m.get("title") or "").lower() for team in game.get("teams", []))
+                                    ]
+                                    
+                                    if matching_markets:
+                                        market = matching_markets[0]
+                                        ticker = market.get("ticker")
+                                        orderbook = kalshi_api.get_orderbook(ticker)
+                                        
+                                        alpha = generate_alpha_insight_with_llm(game, market, orderbook, use_search=True)
+                                        if alpha:
+                                            alert_msg += f"    {alpha}\n"
+                                        else:
+                                            yes_bids = orderbook.get("yes_bids", [])
+                                            yes_asks = orderbook.get("yes_asks", [])
+                                            if yes_bids and yes_asks:
+                                                market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+                                                alert_msg += f"    Market Price: {market_prob:.0f}% (ticker: {ticker})\n"
+                                except Exception as e:
+                                    logger.warning(f"[PARALLEL] Failed to compare game with market: {e}")
+                            
+                            alert_msg += "\n"
+                
+                PARALLEL_ALERTS.append({
+                    "monitor_id": monitor_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "message": alert_msg,
+                    "content_preview": content[:500]
+                })
+                
+                logger.info(f"[PARALLEL ALERT] Monitor '{monitor.get('name', monitor_id)}' triggered alert")
+                print(f"[PARALLEL ALERT] {alert_msg}")
+    except Exception as e:
+        logger.error(f"[PARALLEL ERROR] Failed to check monitor {monitor_id}: {e}")
+        print(f"[PARALLEL ERROR] Failed to check monitor {monitor_id}: {e}")
+
+
+def schedule_parallel_monitor(monitor_id: str):
+    """Schedule a single Parallel monitor with its own interval."""
+    if monitor_id not in PARALLEL_MONITORS:
+        return
+    
+    monitor = PARALLEL_MONITORS[monitor_id]
+    interval = monitor.get("interval", PARALLEL_MONITOR_INTERVAL)
+    job_id = f"parallel_monitor_{monitor_id}"
+    
+    try:
+        scheduler.add_job(
+            check_single_parallel_monitor,
+            'interval',
+            seconds=interval,
+            args=[monitor_id],
+            id=job_id,
+            replace_existing=True
+        )
+        logger.info(f"[PARALLEL] Scheduled monitor '{monitor.get('name', monitor_id)}' with interval {interval}s")
+    except Exception as e:
+        logger.error(f"[PARALLEL] Failed to schedule monitor {monitor_id}: {e}")
+
+
+def filter_active_markets(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filter markets to only include active/open markets that haven't resolved yet."""
+    today = datetime.now().date()
+    active_markets = []
+    
+    for market in markets:
+        status = market.get("status", "").lower()
+        
+        if status not in ["open", "active"]:
+            continue
+        
+        expiration_time = market.get("expiration_time")
+        if expiration_time:
+            try:
+                if isinstance(expiration_time, str):
+                    exp_dt = datetime.fromisoformat(expiration_time.replace("Z", "+00:00"))
+                else:
+                    exp_dt = expiration_time
+                
+                if exp_dt.date() < today:
+                    continue
+            except:
+                pass
+        
+        close_time = market.get("close_time")
+        if close_time:
+            try:
+                if isinstance(close_time, str):
+                    close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                else:
+                    close_dt = close_time
+                
+                if close_dt.date() < today:
+                    continue
+            except:
+                pass
+        
+        active_markets.append(market)
+    
+    return active_markets
+
+
 # =========================
 # OPENAI (fast, short)
 # =========================
@@ -506,6 +1085,7 @@ def openai_generate(call_sid: str, user_text: str) -> str:
         "temperature": 0.8,
     }
 
+    logger.info(f"[API CALL] OpenAI generate - call_sid: {call_sid}, topic: '{topic}', user_text length: {len(user_text)}")
     resp = requests.post(
         "https://api.openai.com/v1/responses",
         headers={
@@ -530,6 +1110,7 @@ def openai_generate(call_sid: str, user_text: str) -> str:
 # ELEVENLABS (blocking but pre-used)
 # =========================
 def elevenlabs_tts(text: str) -> bytes:
+    logger.info(f"[API CALL] ElevenLabs TTS - text length: {len(text)}, voice_id: {ELEVENLABS_VOICE_ID}")
     resp = requests.post(
         f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
         headers={
@@ -583,6 +1164,7 @@ def start_agent_call(to: str, topic: str) -> str:
     gather.play(f"{PUBLIC_BASE_URL}/twilio/audio/pending/{pending_id}")
     vr.append(gather)
 
+    logger.info(f"[API CALL] Twilio create call - to: {to}, topic: '{topic}', from: {TWILIO_PHONE_NUMBER}")
     call = twilio.calls.create(
         to=to,
         from_=TWILIO_PHONE_NUMBER,
@@ -590,6 +1172,7 @@ def start_agent_call(to: str, topic: str) -> str:
         record=True,
         recording_channels="dual",
     )
+    logger.info(f"[API CALL] Twilio call created - call_sid: {call.sid}, status: {call.status}")
 
     CALL_CONTEXT[call.sid] = {
         "topic": topic,
@@ -604,12 +1187,15 @@ def start_agent_call(to: str, topic: str) -> str:
 @mcp.tool(description="Search Kalshi markets by keyword")
 def search_kalshi_markets(query: str, limit: int = 20) -> str:
     """Search for Kalshi markets matching a query."""
+    logger.info(f"[MCP TOOL] search_kalshi_markets called - query: '{query}', limit: {limit}")
     if not kalshi_api:
         return "Error: Kalshi API not configured. Set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY environment variables."
     
     try:
         markets_response = kalshi_api.get_markets(limit=limit)
         markets = markets_response.get("markets", [])
+        markets = filter_active_markets(markets)
+        logger.info(f"[KALSHI] search_kalshi_markets - found {len(markets)} active markets after filtering")
         
         query_lower = query.lower()
         matches = []
@@ -640,6 +1226,7 @@ def search_kalshi_markets(query: str, limit: int = 20) -> str:
 @mcp.tool(description="Get detailed market data, orderbook, and price movement analysis for a Kalshi market ticker")
 def get_kalshi_market(ticker: str) -> str:
     """Get market data, orderbook, and price movement trends for a specific ticker."""
+    logger.info(f"[MCP TOOL] get_kalshi_market called - ticker: '{ticker}'")
     if not kalshi_api:
         return "Error: Kalshi API not configured."
     
@@ -777,6 +1364,7 @@ def get_kalshi_market(ticker: str) -> str:
 @mcp.tool(description="Get AI-generated betting insights for a Kalshi market")
 def get_kalshi_insights(ticker: str) -> str:
     """Get AI-generated betting insights for a market."""
+    logger.info(f"[MCP TOOL] get_kalshi_insights called - ticker: '{ticker}'")
     if not kalshi_api:
         return "Error: Kalshi API not configured."
     
@@ -796,6 +1384,7 @@ def get_kalshi_insights(ticker: str) -> str:
 @mcp.tool(description="Watch a Kalshi market for price alerts")
 def watch_kalshi_market(ticker: str, alert_price: int, direction: str = "above", remove_after_trigger: bool = False) -> str:
     """Set up a price alert for a market. Direction: 'above' or 'below'."""
+    logger.info(f"[MCP TOOL] watch_kalshi_market called - ticker: '{ticker}', alert_price: {alert_price}, direction: '{direction}', remove_after_trigger: {remove_after_trigger}")
     if not kalshi_api:
         return "Error: Kalshi API not configured."
     
@@ -823,6 +1412,7 @@ def watch_kalshi_market(ticker: str, alert_price: int, direction: str = "above",
 @mcp.tool(description="List all watched Kalshi markets")
 def list_kalshi_watches() -> str:
     """List all markets being watched for alerts."""
+    logger.info(f"[MCP TOOL] list_kalshi_watches called")
     if not KALSHI_WATCHES:
         return "No markets being watched."
     
@@ -838,6 +1428,7 @@ def list_kalshi_watches() -> str:
 @mcp.tool(description="Remove a market from watch list")
 def unwatch_kalshi_market(ticker: str) -> str:
     """Stop watching a market for alerts."""
+    logger.info(f"[MCP TOOL] unwatch_kalshi_market called - ticker: '{ticker}'")
     if ticker not in KALSHI_WATCHES:
         return f"{ticker} is not being watched."
     
@@ -849,6 +1440,7 @@ def unwatch_kalshi_market(ticker: str) -> str:
 @mcp.tool(description="Get recent Kalshi market insights and alerts")
 def get_kalshi_recent_insights(limit: int = 10) -> str:
     """Get recent AI insights and price alerts."""
+    logger.info(f"[MCP TOOL] get_kalshi_recent_insights called - limit: {limit}")
     if not KALSHI_INSIGHTS:
         return "No recent insights or alerts."
     
@@ -864,12 +1456,15 @@ def get_kalshi_recent_insights(limit: int = 10) -> str:
 @mcp.tool(description="Find interesting Kalshi markets right now and generate AI insights")
 def find_interesting_kalshi_markets(limit: int = 5, search_query: str = "") -> str:
     """Find interesting markets based on liquidity and activity, then generate AI insights for them."""
+    logger.info(f"[MCP TOOL] find_interesting_kalshi_markets called - limit: {limit}, search_query: '{search_query}'")
     if not kalshi_api:
         return "Error: Kalshi API not configured."
     
     try:
         markets_response = kalshi_api.get_markets(limit=100)
         markets = markets_response.get("markets", [])
+        markets = filter_active_markets(markets)
+        logger.info(f"[KALSHI] find_interesting_kalshi_markets - found {len(markets)} active markets after filtering")
         
         if search_query:
             query_lower = search_query.lower()
@@ -884,10 +1479,6 @@ def find_interesting_kalshi_markets(limit: int = 5, search_query: str = "") -> s
         
         for market in markets:
             ticker = market.get("ticker")
-            status = market.get("status", "").lower()
-            
-            if status not in ["open", "active"]:
-                continue
             
             try:
                 orderbook = kalshi_api.get_orderbook(ticker)
@@ -954,6 +1545,7 @@ def find_interesting_kalshi_markets(limit: int = 5, search_query: str = "") -> s
 @mcp.tool(description="Compare multiple Kalshi markets side-by-side with value analysis and AI recommendations")
 def compare_kalshi_markets(tickers: str) -> str:
     """Compare 2-5 markets. Provide tickers as comma-separated string."""
+    logger.info(f"[MCP TOOL] compare_kalshi_markets called - tickers: '{tickers}'")
     if not kalshi_api:
         return "Error: Kalshi API not configured."
     
@@ -1029,6 +1621,7 @@ def compare_kalshi_markets(tickers: str) -> str:
 @mcp.tool(description="Get comprehensive risk analysis including volume distribution, concentration risk, and volume shifts")
 def get_kalshi_risk_analysis(ticker: str) -> str:
     """Deep risk analysis with volume distribution, concentration risk, and historical trends."""
+    logger.info(f"[MCP TOOL] get_kalshi_risk_analysis called - ticker: '{ticker}'")
     if not kalshi_api:
         return "Error: Kalshi API not configured."
     
@@ -1092,6 +1685,172 @@ def get_kalshi_risk_analysis(ticker: str) -> str:
         return result
     except Exception as e:
         return f"Error getting risk analysis: {str(e)}"
+
+
+@mcp.tool(description="Create a general Parallel API monitor for any URL(s). Monitor interval is in seconds (e.g., 300 for 5 minutes).")
+def create_parallel_monitor(name: str, urls: str, objective: str, monitor_interval: int, monitor_type: str = "general") -> str:
+    """Create a monitor for Parallel API extraction. URLs should be comma-separated. Monitor interval is in seconds."""
+    logger.info(f"[MCP TOOL] create_parallel_monitor called - name: '{name}', type: '{monitor_type}', interval: {monitor_interval}s, urls: {len(urls.split(','))}")
+    if not parallel_api:
+        return "Error: Parallel API not configured. Set PARALLEL_API_KEY environment variable."
+    
+    if monitor_interval < 60:
+        return "Error: Monitor interval must be at least 60 seconds (1 minute)."
+    
+    url_list = [u.strip() for u in urls.split(",") if u.strip()]
+    if not url_list:
+        return "Error: Provide at least one URL."
+    
+    monitor_id = f"monitor_{int(time.time())}"
+    PARALLEL_MONITORS[monitor_id] = {
+        "name": name,
+        "urls": url_list,
+        "objective": objective,
+        "type": monitor_type,
+        "interval": monitor_interval,
+        "created_at": datetime.now().isoformat(),
+        "check_count": 0,
+        "last_content": "",
+        "last_check": None
+    }
+    save_parallel_monitors()
+    
+    # Schedule this monitor
+    schedule_parallel_monitor(monitor_id)
+    
+    return f"Created monitor '{name}' (ID: {monitor_id}) for {len(url_list)} URL(s). Will check every {monitor_interval}s."
+
+
+@mcp.tool(description="Set up Kalshi calendar monitoring to get live game alerts with alpha insights. Monitor interval is in seconds (e.g., 300 for 5 minutes).")
+def setup_kalshi_calendar_monitor(monitor_interval: int) -> str:
+    """Set up automatic monitoring of Kalshi calendar page for live games. Monitor interval is in seconds."""
+    logger.info(f"[MCP TOOL] setup_kalshi_calendar_monitor called - interval: {monitor_interval}s")
+    if not parallel_api:
+        return "Error: Parallel API not configured."
+    
+    if monitor_interval < 60:
+        return "Error: Monitor interval must be at least 60 seconds (1 minute)."
+    
+    monitor_id = "kalshi_calendar"
+    PARALLEL_MONITORS[monitor_id] = {
+        "name": "Kalshi Calendar - Live Games",
+        "urls": ["https://kalshi.com/calendar"],
+        "objective": "Extract all live game information from Kalshi calendar page including market names, prices, categories, live market data, game status, teams, and probabilities",
+        "type": "kalshi_calendar",
+        "interval": monitor_interval,
+        "created_at": datetime.now().isoformat(),
+        "check_count": 0,
+        "last_content": "",
+        "last_check": None
+    }
+    save_parallel_monitors()
+    
+    # Schedule this monitor
+    schedule_parallel_monitor(monitor_id)
+    
+    return f"✅ Kalshi calendar monitoring enabled! Will check every {monitor_interval}s for live games and compare with market probabilities to find alpha opportunities."
+
+
+@mcp.tool(description="List all active Parallel monitors")
+def list_parallel_monitors() -> str:
+    """List all active Parallel API monitors."""
+    logger.info(f"[MCP TOOL] list_parallel_monitors called")
+    if not PARALLEL_MONITORS:
+        return "No active monitors."
+    
+    result = f"Active Monitors ({len(PARALLEL_MONITORS)}):\n\n"
+    for monitor_id, monitor in PARALLEL_MONITORS.items():
+        result += f"• {monitor.get('name', monitor_id)}\n"
+        result += f"  Type: {monitor.get('type', 'general')}\n"
+        result += f"  URLs: {len(monitor.get('urls', []))}\n"
+        result += f"  Checks: {monitor.get('check_count', 0)}\n"
+        result += f"  Interval: {monitor.get('interval', PARALLEL_MONITOR_INTERVAL)}s\n"
+        if monitor.get('last_check'):
+            result += f"  Last Check: {monitor['last_check']}\n"
+        result += "\n"
+    
+    return result
+
+
+@mcp.tool(description="Remove a Parallel monitor")
+def remove_parallel_monitor(monitor_id: str) -> str:
+    """Remove a Parallel API monitor."""
+    logger.info(f"[MCP TOOL] remove_parallel_monitor called - monitor_id: '{monitor_id}'")
+    if monitor_id not in PARALLEL_MONITORS:
+        return f"Monitor '{monitor_id}' not found."
+    
+    # Unschedule the job
+    job_id = f"parallel_monitor_{monitor_id}"
+    try:
+        scheduler.remove_job(job_id)
+        logger.info(f"[PARALLEL] Removed scheduled job for monitor {monitor_id}")
+    except:
+        pass
+    
+    del PARALLEL_MONITORS[monitor_id]
+    save_parallel_monitors()
+    return f"Removed monitor '{monitor_id}'"
+
+
+@mcp.tool(description="Get recent Parallel monitor alerts and insights")
+def get_parallel_alerts(limit: int = 10) -> str:
+    """Get recent alerts from Parallel monitors."""
+    logger.info(f"[MCP TOOL] get_parallel_alerts called - limit: {limit}")
+    if not PARALLEL_ALERTS:
+        return "No recent alerts."
+    
+    recent = PARALLEL_ALERTS[-limit:]
+    result = f"Recent Parallel Alerts ({len(recent)}):\n\n"
+    
+    for alert in recent:
+        result += f"[{alert.get('timestamp', 'N/A')}]\n"
+        result += f"{alert.get('message', 'N/A')}\n"
+        result += "\n" + "="*50 + "\n\n"
+    
+    return result
+
+
+@mcp.tool(description="Manually trigger a Parallel monitor check")
+def check_parallel_monitor(monitor_id: str) -> str:
+    """Manually check a specific Parallel monitor."""
+    logger.info(f"[MCP TOOL] check_parallel_monitor called - monitor_id: '{monitor_id}'")
+    if monitor_id not in PARALLEL_MONITORS:
+        return f"Monitor '{monitor_id}' not found."
+    
+    monitor = PARALLEL_MONITORS[monitor_id]
+    urls = monitor.get("urls", [])
+    objective = monitor.get("objective", "")
+    
+    if not parallel_api:
+        return "Error: Parallel API not configured."
+    
+    try:
+        result = parallel_api.extract(urls, objective, excerpts=True, full_content=True)
+        
+        if "results" in result and result["results"]:
+            content = result["results"][0].get("full_content", "")
+            
+            if monitor.get("type") == "kalshi_calendar":
+                games = parse_kalshi_calendar_content(content)
+                response = f"✅ Checked {monitor.get('name')}\n\n"
+                response += f"Found {len(games)} live games:\n\n"
+                
+                for game in games[:5]:
+                    teams_str = " vs ".join(game.get("teams", ["Unknown"]))
+                    response += f"• {game.get('sport', 'Unknown')}: {teams_str}\n"
+                    if game.get("quarter"):
+                        response += f"  Status: {game['quarter']}\n"
+                    if game.get("yes_probability"):
+                        response += f"  Yes: {game['yes_probability']}%\n"
+                    response += "\n"
+                
+                return response
+            else:
+                return f"✅ Checked {monitor.get('name')}\n\nContent length: {len(content)} characters\nPreview: {content[:200]}..."
+        
+        return f"✅ Checked {monitor.get('name')} - No results returned"
+    except Exception as e:
+        return f"Error checking monitor: {str(e)}"
 
 
 # =========================
@@ -1208,7 +1967,14 @@ if __name__ == "__main__":
                 replace_existing=True
             )
             print(f"[KALSHI] Started background monitoring (interval: {KALSHI_CHECK_INTERVAL}s)")
-        
+    
+    if parallel_api and PARALLEL_MONITOR_ENABLED and PARALLEL_MONITORS:
+        # Schedule each monitor individually with its own interval
+        for monitor_id in PARALLEL_MONITORS.keys():
+            schedule_parallel_monitor(monitor_id)
+        print(f"[PARALLEL] Started background monitoring for {len(PARALLEL_MONITORS)} monitor(s) with individual intervals")
+    
+    if scheduler.get_jobs():
         scheduler.start()
     
     mcp.run(
