@@ -4,3 +4,4 @@ twilio>=5.10.7
 elevenlabs>=2.27.0
 cryptography>=41.0.0
 apscheduler>=3.10.0
+requests>=2.31.0
