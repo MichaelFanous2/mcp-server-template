@@ -116,15 +116,40 @@ class KalshiAPI:
         logger.info(f"[API CALL] Kalshi API - {method} {path}, params: {params}")
         response = self.session.request(method, f"{self.host}{path}", headers=headers, params=params, json=json_data, timeout=30)
         response.raise_for_status()
+        result = response.json()
         logger.info(f"[API CALL] Kalshi API response - {method} {path} - Status: {response.status_code}")
-        return response.json()
+        
+        # Debug logging for orderbook responses to understand structure
+        if "/orderbook" in path:
+            logger.info(f"[KALSHI DEBUG] Orderbook response for {path}: top-level keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
+            if isinstance(result, dict):
+                if "orderbook" in result:
+                    nested = result["orderbook"]
+                    logger.info(f"[KALSHI DEBUG] Nested 'orderbook' found, keys: {list(nested.keys()) if isinstance(nested, dict) else type(nested)}")
+                # Check for various possible structures
+                for key in ["yes_bids", "yes_asks", "no_bids", "no_asks", "yes", "no"]:
+                    if key in result:
+                        val = result[key]
+                        if isinstance(val, list):
+                            logger.info(f"[KALSHI DEBUG] Found {key} as list with {len(val)} items")
+                        elif isinstance(val, dict):
+                            logger.info(f"[KALSHI DEBUG] Found {key} as dict with keys: {list(val.keys())}")
+        
+        return result
     
     def get_markets(self, limit: int = 100, **kwargs) -> Dict[str, Any]:
         params = {"limit": limit, **kwargs}
         return self._request("GET", "/markets", params=params)
     
     def get_orderbook(self, ticker: str) -> Dict[str, Any]:
-        return self._request("GET", f"/markets/{ticker}/orderbook")
+        """Get orderbook for a market. Returns the orderbook data structure."""
+        result = self._request("GET", f"/markets/{ticker}/orderbook")
+        # The API might return the orderbook directly or nested
+        # Check if it's nested under "orderbook" key
+        if isinstance(result, dict) and "orderbook" in result:
+            return result["orderbook"]
+        # Otherwise return the result as-is (it might already be the orderbook)
+        return result
     
     def get_market(self, ticker: str) -> Dict[str, Any]:
         return self._request("GET", f"/markets/{ticker}")
@@ -592,13 +617,52 @@ def save_parallel_monitors():
 
 def format_kalshi_odds(orderbook: Dict[str, Any], ticker: str) -> str:
     """Format Kalshi orderbook data into readable odds/probabilities with bid/ask prices and volumes."""
+    # get_orderbook() already unwraps nested structures, so orderbook should be flat
+    # But handle both cases just in case
+    original_orderbook = orderbook
+    if isinstance(orderbook, dict) and "orderbook" in orderbook:
+        orderbook = orderbook["orderbook"]
+    
+    if not isinstance(orderbook, dict):
+        logger.error(f"[KALSHI] Invalid orderbook structure for {ticker}: {type(orderbook)}")
+        return f"    💰 Kalshi Market: Invalid orderbook data (ticker: {ticker})\n"
+    
+    # Kalshi API returns: yes_bids, yes_asks, no_bids, no_asks as arrays of {price, size} objects
     yes_bids = orderbook.get("yes_bids", [])
     yes_asks = orderbook.get("yes_asks", [])
     no_bids = orderbook.get("no_bids", [])
     no_asks = orderbook.get("no_asks", [])
     
+    # If not found, try nested "yes" and "no" structures (alternative format)
+    if not yes_bids and "yes" in orderbook:
+        yes_data = orderbook["yes"]
+        if isinstance(yes_data, dict):
+            yes_bids = yes_data.get("bids", yes_data.get("yes_bids", []))
+            yes_asks = yes_data.get("asks", yes_data.get("yes_asks", []))
+        elif isinstance(yes_data, list):
+            yes_bids = yes_data
+    
+    if not no_bids and "no" in orderbook:
+        no_data = orderbook["no"]
+        if isinstance(no_data, dict):
+            no_bids = no_data.get("bids", no_data.get("no_bids", []))
+            no_asks = no_data.get("asks", no_data.get("no_asks", []))
+        elif isinstance(no_data, list):
+            no_bids = no_data
+    
+    # Log what we found for debugging
+    logger.info(f"[KALSHI DEBUG] format_kalshi_odds for {ticker} - yes_bids: {len(yes_bids) if yes_bids else 0}, yes_asks: {len(yes_asks) if yes_asks else 0}, no_bids: {len(no_bids) if no_bids else 0}, no_asks: {len(no_asks) if no_asks else 0}")
+    
     if not yes_bids or not yes_asks:
-        return f"    💰 Kalshi Market: No active orderbook (ticker: {ticker})\n"
+        # Log the full structure for debugging
+        logger.warning(f"[KALSHI] No orderbook data for {ticker} - checking structure...")
+        logger.warning(f"[KALSHI DEBUG] Orderbook top-level keys: {list(original_orderbook.keys()) if isinstance(original_orderbook, dict) else 'Not a dict'}")
+        logger.warning(f"[KALSHI DEBUG] Orderbook data keys: {list(orderbook.keys())}")
+        # Try to show a sample of the structure
+        if isinstance(orderbook, dict):
+            sample = {k: str(v)[:100] for k, v in list(orderbook.items())[:5]}
+            logger.warning(f"[KALSHI DEBUG] Orderbook sample: {sample}")
+        return f"    💰 Kalshi Market: No active orderbook (ticker: {ticker}) - Market may not have liquidity yet\n"
     
     yes_bid_price = yes_bids[0].get("price", 0)
     yes_ask_price = yes_asks[0].get("price", 100)
@@ -938,9 +1002,9 @@ def check_parallel_monitors():
                                 # PROBABILITIES - Kalshi API market prices
                                 if game.get("teams") and kalshi_api:
                                     try:
-                                        markets_resp = kalshi_api.get_markets(limit=50)
+                                        markets_resp = kalshi_api.get_markets(limit=50, status="open")
                                         markets = markets_resp.get("markets", [])
-                                        markets = filter_active_markets(markets)
+                                        markets = filter_active_markets(markets, max_days_ahead=2)  # Live games should be within 2 days
                                         
                                         matching_markets = [
                                             m for m in markets
@@ -998,9 +1062,9 @@ def check_parallel_monitors():
                                 # PROBABILITIES - Kalshi API market prices
                                 if game.get("teams") and kalshi_api:
                                     try:
-                                        markets_resp = kalshi_api.get_markets(limit=50)
+                                        markets_resp = kalshi_api.get_markets(limit=50, status="open")
                                         markets = markets_resp.get("markets", [])
-                                        markets = filter_active_markets(markets)
+                                        markets = filter_active_markets(markets, max_days_ahead=2)  # Live games should be within 2 days
                                         
                                         matching_markets = [
                                             m for m in markets
@@ -1126,9 +1190,9 @@ def check_single_parallel_monitor(monitor_id: str):
                             # PROBABILITIES - Kalshi API market prices
                             if game.get("teams") and kalshi_api:
                                 try:
-                                    markets_resp = kalshi_api.get_markets(limit=50)
+                                    markets_resp = kalshi_api.get_markets(limit=50, status="open")
                                     markets = markets_resp.get("markets", [])
-                                    markets = filter_active_markets(markets)
+                                    markets = filter_active_markets(markets, max_days_ahead=2)  # Live games: 2 days
                                     
                                     matching_markets = [
                                         m for m in markets
@@ -1186,9 +1250,9 @@ def check_single_parallel_monitor(monitor_id: str):
                             # PROBABILITIES - Kalshi API market prices
                             if game.get("teams") and kalshi_api:
                                 try:
-                                    markets_resp = kalshi_api.get_markets(limit=50)
+                                    markets_resp = kalshi_api.get_markets(limit=50, status="open")
                                     markets = markets_resp.get("markets", [])
-                                    markets = filter_active_markets(markets)
+                                    markets = filter_active_markets(markets, max_days_ahead=2)  # Live games: 2 days
                                     
                                     matching_markets = [
                                         m for m in markets
@@ -1254,17 +1318,19 @@ def schedule_parallel_monitor(monitor_id: str):
         logger.error(f"[PARALLEL] Failed to schedule monitor {monitor_id}: {e}")
 
 
-def filter_active_markets(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Filter markets to only include active/open markets that haven't resolved yet."""
-    today = datetime.now().date()
+def filter_active_markets(markets: List[Dict[str, Any]], max_days_ahead: int = 7) -> List[Dict[str, Any]]:
+    """Filter markets to only include live/active markets expiring within max_days_ahead days."""
+    now = datetime.now()
     active_markets = []
     
     for market in markets:
         status = market.get("status", "").lower()
         
+        # Only include open/active markets
         if status not in ["open", "active"]:
             continue
         
+        # Check expiration_time - must be in the future but within max_days_ahead
         expiration_time = market.get("expiration_time")
         if expiration_time:
             try:
@@ -1273,11 +1339,18 @@ def filter_active_markets(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 else:
                     exp_dt = expiration_time
                 
-                if exp_dt.date() < today:
+                # Skip if already expired
+                if exp_dt < now:
+                    continue
+                
+                # Skip if too far in the future (not "live" yet)
+                days_until_exp = (exp_dt - now).total_seconds() / 86400
+                if days_until_exp > max_days_ahead:
                     continue
             except:
                 pass
         
+        # Check close_time - must be in the future but within max_days_ahead
         close_time = market.get("close_time")
         if close_time:
             try:
@@ -1286,10 +1359,20 @@ def filter_active_markets(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 else:
                     close_dt = close_time
                 
-                if close_dt.date() < today:
+                # Skip if already closed
+                if close_dt < now:
+                    continue
+                
+                # Skip if too far in the future
+                days_until_close = (close_dt - now).total_seconds() / 86400
+                if days_until_close > max_days_ahead:
                     continue
             except:
                 pass
+        
+        # If no expiration or close time, include it (but log a warning)
+        if not expiration_time and not close_time:
+            logger.warning(f"[KALSHI] Market {market.get('ticker')} has no expiration/close time")
         
         active_markets.append(market)
     
@@ -1429,10 +1512,12 @@ def search_kalshi_markets(query: str, limit: int = 20) -> str:
         return "Error: Kalshi API not configured. Set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY environment variables."
     
     try:
-        markets_response = kalshi_api.get_markets(limit=limit)
+        # Use status=open to filter for only open markets from API
+        markets_response = kalshi_api.get_markets(limit=limit * 3, status="open")  # Get more to account for filtering
         markets = markets_response.get("markets", [])
-        markets = filter_active_markets(markets)
-        logger.info(f"[KALSHI] search_kalshi_markets - found {len(markets)} active markets after filtering")
+        # Filter to only live markets (expiring within 7 days)
+        markets = filter_active_markets(markets, max_days_ahead=7)
+        logger.info(f"[KALSHI] search_kalshi_markets - found {len(markets)} live markets (expiring within 7 days) after filtering")
         
         query_lower = query.lower()
         matches = []
@@ -1698,10 +1783,10 @@ def find_interesting_kalshi_markets(limit: int = 5, search_query: str = "") -> s
         return "Error: Kalshi API not configured."
     
     try:
-        markets_response = kalshi_api.get_markets(limit=100)
+        markets_response = kalshi_api.get_markets(limit=100, status="open")
         markets = markets_response.get("markets", [])
-        markets = filter_active_markets(markets)
-        logger.info(f"[KALSHI] find_interesting_kalshi_markets - found {len(markets)} active markets after filtering")
+        markets = filter_active_markets(markets, max_days_ahead=7)  # Interesting markets: 7 days
+        logger.info(f"[KALSHI] find_interesting_kalshi_markets - found {len(markets)} live markets (expiring within 7 days) after filtering")
         
         if search_query:
             query_lower = search_query.lower()
@@ -2094,9 +2179,9 @@ def check_parallel_monitor(monitor_id: str) -> str:
                         # Get Kalshi API live odds
                         if game.get("teams") and kalshi_api:
                             try:
-                                markets_resp = kalshi_api.get_markets(limit=100)
+                                markets_resp = kalshi_api.get_markets(limit=100, status="open")
                                 markets = markets_resp.get("markets", [])
-                                markets = filter_active_markets(markets)
+                                markets = filter_active_markets(markets, max_days_ahead=2)  # Live games: 2 days
                                 
                                 matching_markets = [
                                     m for m in markets
@@ -2137,9 +2222,9 @@ def check_parallel_monitor(monitor_id: str) -> str:
                         # Get Kalshi API odds for upcoming games
                         if game.get("teams") and kalshi_api:
                             try:
-                                markets_resp = kalshi_api.get_markets(limit=100)
+                                markets_resp = kalshi_api.get_markets(limit=100, status="open")
                                 markets = markets_resp.get("markets", [])
-                                markets = filter_active_markets(markets)
+                                markets = filter_active_markets(markets, max_days_ahead=2)  # Live games: 2 days
                                 
                                 matching_markets = [
                                     m for m in markets
