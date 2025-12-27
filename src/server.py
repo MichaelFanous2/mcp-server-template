@@ -47,65 +47,53 @@ MAX_CALL_DURATION_SECONDS = 240
 
 
 # =========================
-# LOGGING
+# HELPERS
 # =========================
-def log(msg: str):
-    print(f"\n=== {msg} ===\n", flush=True)
-
-
 def now() -> float:
     return time.time()
 
 
-def audio_path(call_sid: str, turn_id: str) -> Path:
-    return AUDIO_DIR / f"{call_sid}_{turn_id}.mp3"
+def audio_path(key: str) -> Path:
+    return AUDIO_DIR / f"{key}.mp3"
 
 
-def write_audio(call_sid: str, turn_id: str, audio: bytes) -> Path:
-    p = audio_path(call_sid, turn_id)
+def write_audio(key: str, audio: bytes):
+    p = audio_path(key)
     with open(p, "wb") as f:
         f.write(audio)
-    return p
 
 
-# =========================
-# GREETING (topic-aware, zero latency)
-# =========================
 def greeting_for_topic(topic: str) -> str:
     topic = (topic or "").strip()
     if not topic:
         return "Hey. Go ahead."
-
     return f"Hey. Let’s talk about {topic}. Go ahead."
 
 
 # =========================
-# OPENAI (text only, latency-biased)
+# OPENAI (fast, short)
 # =========================
 def openai_generate(call_sid: str, user_text: str) -> str:
     ctx = CALL_CONTEXT[call_sid]
     topic = ctx["topic"]
-    history: List[Tuple[str, str]] = ctx["history"]
+    history = ctx["history"][-4:]
 
     transcript = ""
-    for role, text in history[-6:]:
+    for role, text in history:
         transcript += f"{role.upper()}: {text}\n"
-
-    instructions = (
-        "You are in a live phone conversation.\n"
-        "Respond immediately.\n"
-        "Use 1–2 short sentences max.\n"
-        "Be natural and human.\n"
-        "Do NOT mention AI, tools, or systems.\n"
-        f"Topic/context: {topic}\n"
-    )
 
     payload = {
         "model": "gpt-4.1-mini",
-        "instructions": instructions,
+        "instructions": (
+            "Respond immediately.\n"
+            "Use 1 short sentence.\n"
+            "Be human.\n"
+            "Do not mention AI.\n"
+            f"Topic: {topic}\n"
+        ),
         "input": transcript + f"USER: {user_text}\nASSISTANT:",
-        "max_output_tokens": 80,
-        "temperature": 0.9,
+        "max_output_tokens": 60,
+        "temperature": 0.8,
     }
 
     resp = requests.post(
@@ -115,13 +103,13 @@ def openai_generate(call_sid: str, user_text: str) -> str:
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=15,
+        timeout=10,
     )
 
     resp.raise_for_status()
     data = resp.json()
-
     text = data["output"][0]["content"][0]["text"].strip()
+
     if text and not text.endswith((".", "!", "?")):
         text += "."
 
@@ -129,18 +117,9 @@ def openai_generate(call_sid: str, user_text: str) -> str:
 
 
 # =========================
-# ELEVENLABS (tts only, fast)
+# ELEVENLABS (blocking but pre-used)
 # =========================
 def elevenlabs_tts(text: str) -> bytes:
-    payload = {
-        "text": text,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {
-            "stability": 0.45,
-            "similarity_boost": 0.8,
-        },
-    }
-
     resp = requests.post(
         f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
         headers={
@@ -148,8 +127,15 @@ def elevenlabs_tts(text: str) -> bytes:
             "Accept": "audio/mpeg",
             "Content-Type": "application/json",
         },
-        json=payload,
-        timeout=40,
+        json={
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {
+                "stability": 0.45,
+                "similarity_boost": 0.8,
+            },
+        },
+        timeout=30,
     )
 
     resp.raise_for_status()
@@ -159,19 +145,14 @@ def elevenlabs_tts(text: str) -> bytes:
 # =========================
 # MCP TOOLS
 # =========================
-@mcp.tool(description="Send an SMS via Twilio")
-def send_sms(to: str, body: str) -> str:
-    msg = twilio.messages.create(
-        to=to,
-        from_=TWILIO_PHONE_NUMBER,
-        body=body
-    )
-    return f"SMS sent ({msg.sid})"
-
-
-@mcp.tool(description="Start an AI phone call")
+@mcp.tool(description="Start an AI phone call (ultra low latency)")
 def start_agent_call(to: str, topic: str) -> str:
     pending_id = str(int(now() * 1000))
+
+    # PRE-GENERATE GREETING AUDIO
+    greeting_text = greeting_for_topic(topic)
+    greeting_audio = elevenlabs_tts(greeting_text)
+    write_audio(f"pending_{pending_id}", greeting_audio)
 
     CALL_CONTEXT[f"PENDING:{pending_id}"] = {
         "topic": topic,
@@ -186,8 +167,8 @@ def start_agent_call(to: str, topic: str) -> str:
         action=f"{PUBLIC_BASE_URL}/twilio/voice/handle?pending_id={pending_id}",
         method="POST",
         barge_in=True,
-        timeout=3,
-        speech_timeout="auto",
+        timeout=2,
+        speech_timeout=0,
     )
     gather.play(f"{PUBLIC_BASE_URL}/twilio/audio/pending/{pending_id}")
     vr.append(gather)
@@ -195,7 +176,9 @@ def start_agent_call(to: str, topic: str) -> str:
     call = twilio.calls.create(
         to=to,
         from_=TWILIO_PHONE_NUMBER,
-        twiml=str(vr)
+        twiml=str(vr),
+        record=True,
+        recording_channels="dual",
     )
 
     CALL_CONTEXT[call.sid] = {
@@ -214,14 +197,10 @@ def start_agent_call(to: str, topic: str) -> str:
 @mcp.custom_route("/twilio/audio/pending/{pending_id}", methods=["GET"])
 async def twilio_audio_pending(request: Request):
     pending_id = request.path_params["pending_id"]
-    ctx = CALL_CONTEXT.get(f"PENDING:{pending_id}")
-
-    if not ctx:
+    p = audio_path(f"pending_{pending_id}")
+    if not p.exists():
         return PlainTextResponse("not found", status_code=404)
-
-    greeting_text = greeting_for_topic(ctx.get("topic"))
-    audio = elevenlabs_tts(greeting_text)
-    return Response(audio, media_type="audio/mpeg")
+    return Response(p.read_bytes(), media_type="audio/mpeg")
 
 
 @mcp.custom_route("/twilio/voice/handle", methods=["POST"])
@@ -249,10 +228,10 @@ async def twilio_voice_handle(request: Request):
         return PlainTextResponse(str(vr), media_type="text/xml")
 
     if now() - ctx["start_time"] > MAX_CALL_DURATION_SECONDS:
-        audio = elevenlabs_tts("I have to run. Talk soon.")
-        turn_id = str(int(now() * 1000))
-        write_audio(call_sid, turn_id, audio)
-        vr.play(f"{PUBLIC_BASE_URL}/twilio/audio/{call_sid}/{turn_id}")
+        goodbye_audio = elevenlabs_tts("I have to run. Talk soon.")
+        key = f"{call_sid}_end"
+        write_audio(key, goodbye_audio)
+        vr.play(f"{PUBLIC_BASE_URL}/twilio/audio/{key}")
         vr.hangup()
         return PlainTextResponse(str(vr), media_type="text/xml")
 
@@ -261,8 +240,8 @@ async def twilio_voice_handle(request: Request):
             input="speech",
             action=f"{PUBLIC_BASE_URL}/twilio/voice/handle",
             method="POST",
-            timeout=3,
-            speech_timeout="auto",
+            timeout=2,
+            speech_timeout=0,
         )
         vr.append(gather)
         return PlainTextResponse(str(vr), media_type="text/xml")
@@ -273,32 +252,29 @@ async def twilio_voice_handle(request: Request):
     ctx["history"].append(("assistant", reply))
 
     audio = elevenlabs_tts(reply)
-    turn_id = str(int(now() * 1000))
-    write_audio(call_sid, turn_id, audio)
+    key = f"{call_sid}_{int(now() * 1000)}"
+    write_audio(key, audio)
 
     gather = Gather(
         input="speech",
         action=f"{PUBLIC_BASE_URL}/twilio/voice/handle",
         method="POST",
         barge_in=True,
-        timeout=3,
-        speech_timeout="auto",
+        timeout=2,
+        speech_timeout=0,
     )
-    gather.play(f"{PUBLIC_BASE_URL}/twilio/audio/{call_sid}/{turn_id}")
+    gather.play(f"{PUBLIC_BASE_URL}/twilio/audio/{key}")
     vr.append(gather)
 
     return PlainTextResponse(str(vr), media_type="text/xml")
 
 
-@mcp.custom_route("/twilio/audio/{call_sid}/{turn_id}", methods=["GET"])
+@mcp.custom_route("/twilio/audio/{key}", methods=["GET"])
 async def twilio_audio(request: Request):
-    call_sid = request.path_params["call_sid"]
-    turn_id = request.path_params["turn_id"]
-
-    p = audio_path(call_sid, turn_id)
+    key = request.path_params["key"]
+    p = audio_path(key)
     if not p.exists():
         return PlainTextResponse("not found", status_code=404)
-
     return Response(p.read_bytes(), media_type="audio/mpeg")
 
 
