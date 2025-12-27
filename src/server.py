@@ -590,6 +590,42 @@ def save_parallel_monitors():
         pass
 
 
+def format_kalshi_odds(orderbook: Dict[str, Any], ticker: str) -> str:
+    """Format Kalshi orderbook data into readable odds/probabilities with bid/ask prices and volumes."""
+    yes_bids = orderbook.get("yes_bids", [])
+    yes_asks = orderbook.get("yes_asks", [])
+    no_bids = orderbook.get("no_bids", [])
+    no_asks = orderbook.get("no_asks", [])
+    
+    if not yes_bids or not yes_asks:
+        return f"    💰 Kalshi Market: No active orderbook (ticker: {ticker})\n"
+    
+    yes_bid_price = yes_bids[0].get("price", 0)
+    yes_ask_price = yes_asks[0].get("price", 100)
+    yes_mid = (yes_bid_price + yes_ask_price) / 2
+    yes_spread = yes_ask_price - yes_bid_price
+    yes_bid_vol = yes_bids[0].get("size", 0)
+    yes_ask_vol = yes_asks[0].get("size", 0)
+    
+    result = f"    💰 Kalshi Live Odds (ticker: {ticker}):\n"
+    result += f"      ✅ YES: {yes_mid:.1f}% (bid: {yes_bid_price}¢ @ {yes_bid_vol} contracts, ask: {yes_ask_price}¢ @ {yes_ask_vol} contracts, spread: {yes_spread:.1f}¢)\n"
+    
+    if no_bids and no_asks:
+        no_bid_price = no_bids[0].get("price", 0)
+        no_ask_price = no_asks[0].get("price", 100)
+        no_mid = (no_bid_price + no_ask_price) / 2
+        no_spread = no_ask_price - no_bid_price
+        no_bid_vol = no_bids[0].get("size", 0)
+        no_ask_vol = no_asks[0].get("size", 0)
+        result += f"      ❌ NO: {no_mid:.1f}% (bid: {no_bid_price}¢ @ {no_bid_vol} contracts, ask: {no_ask_price}¢ @ {no_ask_vol} contracts, spread: {no_spread:.1f}¢)\n"
+    else:
+        # Calculate No from Yes (should be ~100 - Yes)
+        no_prob = 100 - yes_mid
+        result += f"      ❌ NO: ~{no_prob:.1f}% (derived from Yes price)\n"
+    
+    return result
+
+
 def parse_kalshi_calendar_content(content: str) -> Dict[str, List[Dict[str, Any]]]:
     """Parse Kalshi calendar page to extract live games, upcoming games, scores, and probabilities."""
     result = {
@@ -921,7 +957,7 @@ def check_parallel_monitors():
                                             if yes_bids and yes_asks:
                                                 market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
                                                 spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
-                                                alert_msg += f"    💰 Kalshi Market: {market_prob:.1f}% Yes (ticker: {ticker}, spread: {spread:.1f}¢)\n"
+                                                alert_msg += format_kalshi_odds(orderbook, ticker)
                                                 
                                                 # Alpha detection
                                                 alpha = generate_alpha_insight_with_llm(game, market, orderbook, use_search=True)
@@ -981,7 +1017,7 @@ def check_parallel_monitors():
                                             if yes_bids and yes_asks:
                                                 market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
                                                 spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
-                                                alert_msg += f"    💰 Kalshi Market: {market_prob:.1f}% Yes (ticker: {ticker}, spread: {spread:.1f}¢)\n"
+                                                alert_msg += format_kalshi_odds(orderbook, ticker)
                                         else:
                                             alert_msg += f"    💰 Kalshi Market: No matching market found\n"
                                     except Exception as e:
@@ -1109,7 +1145,7 @@ def check_single_parallel_monitor(monitor_id: str):
                                         if yes_bids and yes_asks:
                                             market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
                                             spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
-                                            alert_msg += f"    💰 Kalshi Market: {market_prob:.1f}% Yes (ticker: {ticker}, spread: {spread:.1f}¢)\n"
+                                            alert_msg += format_kalshi_odds(orderbook, ticker)
                                             
                                             # Alpha detection
                                             alpha = generate_alpha_insight_with_llm(game, market, orderbook, use_search=True)
@@ -1169,7 +1205,7 @@ def check_single_parallel_monitor(monitor_id: str):
                                         if yes_bids and yes_asks:
                                             market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
                                             spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
-                                            alert_msg += f"    💰 Kalshi Market: {market_prob:.1f}% Yes (ticker: {ticker}, spread: {spread:.1f}¢)\n"
+                                            alert_msg += format_kalshi_odds(orderbook, ticker)
                                     else:
                                         alert_msg += f"    💰 Kalshi Market: No matching market found\n"
                                 except Exception as e:
@@ -2053,7 +2089,34 @@ def check_parallel_monitor(monitor_id: str) -> str:
                                 probs.append(f"Yes: {game['yes_probability']}%")
                             if game.get("no_probability"):
                                 probs.append(f"No: {game['no_probability']}%")
-                            response += f"  📈 Probabilities: {', '.join(probs)}\n"
+                            response += f"  📈 Calendar Probabilities: {', '.join(probs)}\n"
+                        
+                        # Get Kalshi API live odds
+                        if game.get("teams") and kalshi_api:
+                            try:
+                                markets_resp = kalshi_api.get_markets(limit=100)
+                                markets = markets_resp.get("markets", [])
+                                markets = filter_active_markets(markets)
+                                
+                                matching_markets = [
+                                    m for m in markets
+                                    if any(team.lower() in (m.get("title") or "").lower() for team in game.get("teams", []))
+                                ]
+                                
+                                if matching_markets:
+                                    market = matching_markets[0]
+                                    ticker = market.get("ticker")
+                                    orderbook = kalshi_api.get_orderbook(ticker)
+                                    response += format_kalshi_odds(orderbook, ticker)
+                                    
+                                    if len(matching_markets) > 1:
+                                        response += f"      📊 {len(matching_markets)} total markets available\n"
+                                else:
+                                    response += f"  💰 Kalshi Market: No matching market found\n"
+                            except Exception as e:
+                                logger.warning(f"[PARALLEL] Failed to get market data: {e}")
+                                response += f"  💰 Kalshi Market: Error fetching data\n"
+                        
                         response += "\n"
                 
                 if upcoming_games:
@@ -2069,7 +2132,34 @@ def check_parallel_monitor(monitor_id: str) -> str:
                                 probs.append(f"Yes: {game['yes_probability']}%")
                             if game.get("no_probability"):
                                 probs.append(f"No: {game['no_probability']}%")
-                            response += f"  📈 Probabilities: {', '.join(probs)}\n"
+                            response += f"  📈 Calendar Probabilities: {', '.join(probs)}\n"
+                        
+                        # Get Kalshi API odds for upcoming games
+                        if game.get("teams") and kalshi_api:
+                            try:
+                                markets_resp = kalshi_api.get_markets(limit=100)
+                                markets = markets_resp.get("markets", [])
+                                markets = filter_active_markets(markets)
+                                
+                                matching_markets = [
+                                    m for m in markets
+                                    if any(team.lower() in (m.get("title") or "").lower() for team in game.get("teams", []))
+                                ]
+                                
+                                if matching_markets:
+                                    market = matching_markets[0]
+                                    ticker = market.get("ticker")
+                                    orderbook = kalshi_api.get_orderbook(ticker)
+                                    response += format_kalshi_odds(orderbook, ticker)
+                                    
+                                    if len(matching_markets) > 1:
+                                        response += f"      📊 {len(matching_markets)} total markets available\n"
+                                else:
+                                    response += f"  💰 Kalshi Market: No matching market found\n"
+                            except Exception as e:
+                                logger.warning(f"[PARALLEL] Failed to get market data: {e}")
+                                response += f"  💰 Kalshi Market: Error fetching data\n"
+                        
                         response += "\n"
                 
                 if not live_games and not upcoming_games:
