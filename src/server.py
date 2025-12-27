@@ -41,6 +41,8 @@ KALSHI_API_HOST = os.environ.get("KALSHI_API_HOST", "https://api.elections.kalsh
 KALSHI_CHECK_INTERVAL = int(os.environ.get("KALSHI_CHECK_INTERVAL", "3600"))
 KALSHI_ALERTS_ENABLED = os.environ.get("KALSHI_ALERTS_ENABLED", "true").lower() == "true"
 KALSHI_INSIGHTS_ENABLED = os.environ.get("KALSHI_INSIGHTS_ENABLED", "true").lower() == "true"
+KALSHI_SCHEDULE_DAYS = os.environ.get("KALSHI_SCHEDULE_DAYS", "sat,sun")
+KALSHI_SCHEDULE_HOURS = os.environ.get("KALSHI_SCHEDULE_HOURS", "9-21")
 
 
 # =========================
@@ -1184,15 +1186,30 @@ async def twilio_audio(request: Request):
 # =========================
 if __name__ == "__main__":
     if kalshi_api and KALSHI_ALERTS_ENABLED:
-        scheduler.add_job(
-            check_kalshi_watches,
-            'interval',
-            seconds=KALSHI_CHECK_INTERVAL,
-            id='kalshi_watch_check',
-            replace_existing=True
-        )
+        use_cron = os.environ.get("KALSHI_USE_CRON_SCHEDULE", "true").lower() == "true"
+        
+        if use_cron:
+            scheduler.add_job(
+                check_kalshi_watches,
+                'cron',
+                day_of_week=KALSHI_SCHEDULE_DAYS,
+                hour=KALSHI_SCHEDULE_HOURS,
+                minute=0,
+                id='kalshi_watch_check',
+                replace_existing=True
+            )
+            print(f"[KALSHI] Started background monitoring (cron: {KALSHI_SCHEDULE_DAYS} at {KALSHI_SCHEDULE_HOURS}:00)")
+        else:
+            scheduler.add_job(
+                check_kalshi_watches,
+                'interval',
+                seconds=KALSHI_CHECK_INTERVAL,
+                id='kalshi_watch_check',
+                replace_existing=True
+            )
+            print(f"[KALSHI] Started background monitoring (interval: {KALSHI_CHECK_INTERVAL}s)")
+        
         scheduler.start()
-        print(f"[KALSHI] Started background monitoring (interval: {KALSHI_CHECK_INTERVAL}s)")
     
     mcp.run(
         transport="http",

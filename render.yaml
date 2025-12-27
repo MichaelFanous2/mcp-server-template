@@ -9,3 +9,15 @@ services:
     envVars:
       - key: ENVIRONMENT
         value: production
+      - key: KALSHI_CHECK_INTERVAL
+        value: "3600"
+      - key: KALSHI_ALERTS_ENABLED
+        value: "true"
+      - key: KALSHI_INSIGHTS_ENABLED
+        value: "true"
+      - key: KALSHI_USE_CRON_SCHEDULE
+        value: "true"
+      - key: KALSHI_SCHEDULE_DAYS
+        value: "sat,sun"
+      - key: KALSHI_SCHEDULE_HOURS
+        value: "9-21"
