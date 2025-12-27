@@ -590,28 +590,48 @@ def save_parallel_monitors():
         pass
 
 
-def parse_kalshi_calendar_content(content: str) -> List[Dict[str, Any]]:
-    """Parse Kalshi calendar page to extract live game information."""
-    games = []
-    
-    if "LIVE" not in content:
-        return games
+def parse_kalshi_calendar_content(content: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Parse Kalshi calendar page to extract live games, upcoming games, scores, and probabilities."""
+    result = {
+        "live_games": [],
+        "upcoming_games": []
+    }
     
     lines = content.split("\n")
     current_game = None
+    game_status = None  # "LIVE", "UPCOMING", or None
     
     for i, line in enumerate(lines):
         line = line.strip()
         if not line or line == "* * *" or "© 2025" in line:
             continue
         
-        if "LIVE" in line and ("Q" in line or "HALFTIME" in line):
+        # Detect LIVE games
+        if "LIVE" in line and ("Q" in line or "HALFTIME" in line or "OT" in line):
             if current_game and current_game.get("teams"):
-                games.append(current_game)
+                if game_status == "LIVE":
+                    result["live_games"].append(current_game)
+                elif game_status == "UPCOMING":
+                    result["upcoming_games"].append(current_game)
             current_game = {"status": "LIVE", "raw_line": line}
+            game_status = "LIVE"
+        
+        # Detect upcoming games (has time like "Dec 27 @ 4:30pm EST" or "@ 7pm")
+        if "@" in line and ("pm" in line.lower() or "am" in line.lower() or "EST" in line or "PST" in line):
+            if current_game and current_game.get("teams") and game_status != "LIVE":
+                result["upcoming_games"].append(current_game)
+            if not current_game or current_game.get("status") != "LIVE":
+                current_game = {"status": "UPCOMING", "raw_line": line}
+                game_status = "UPCOMING"
+                # Extract time
+                time_match = line
+                if "@" in time_match:
+                    time_part = time_match.split("@")[-1].strip()
+                    current_game["start_time"] = time_part
         
         if current_game:
-            if any(x in line for x in ["Pro Football", "College Football", "Pro Basketball", "College Basketball"]):
+            # Extract sport type and teams
+            if any(x in line for x in ["Pro Football", "College Football", "Pro Basketball", "College Basketball", "Basketball", "Football"]):
                 parts = line.split()
                 sport_type = None
                 teams = []
@@ -619,7 +639,7 @@ def parse_kalshi_calendar_content(content: str) -> List[Dict[str, Any]]:
                 for j, part in enumerate(parts):
                     if part in ["Pro", "College"] and j + 1 < len(parts):
                         sport_type = f"{part} {parts[j+1]}"
-                    elif part.isupper() and len(part) > 1 and part not in ["LIVE", "Q", "HALFTIME"]:
+                    elif part.isupper() and len(part) > 1 and part not in ["LIVE", "Q", "HALFTIME", "OT", "EST", "PST", "AM", "PM"]:
                         if len(teams) < 2:
                             teams.append(part)
                 
@@ -628,6 +648,23 @@ def parse_kalshi_calendar_content(content: str) -> List[Dict[str, Any]]:
                 if teams:
                     current_game["teams"] = teams
             
+            # Extract scores (look for patterns like "9 8 7 6 5 4 3 2 1 0" or "78% 22%")
+            # Scores often appear as numbers separated by spaces before percentages
+            if any(char.isdigit() for char in line) and ("%" in line or len([x for x in line.split() if x.isdigit()]) >= 2):
+                # Try to extract score from patterns like "Team1 Score1 Team2 Score2" or number sequences
+                parts = line.split()
+                numbers = [p for p in parts if p.isdigit() and len(p) <= 3]
+                if len(numbers) >= 2 and current_game.get("teams") and len(current_game["teams"]) >= 2:
+                    # Likely scores - take first two significant numbers
+                    try:
+                        score1 = int(numbers[0])
+                        score2 = int(numbers[1])
+                        if score1 < 200 and score2 < 200:  # Reasonable score range
+                            current_game["score"] = f"{current_game['teams'][0]} {score1} - {current_game['teams'][1]} {score2}"
+                    except:
+                        pass
+            
+            # Extract probabilities
             if "%" in line:
                 try:
                     parts = line.split()
@@ -638,12 +675,22 @@ def parse_kalshi_calendar_content(content: str) -> List[Dict[str, Any]]:
                                 prev = parts[j-1].lower()
                                 if prev in ["yes", "no"]:
                                     current_game[f"{prev}_probability"] = pct
+                                # Also check if it's a team probability (like "78% 22%")
+                                elif pct > 0 and pct < 100 and not current_game.get("yes_probability"):
+                                    # Might be team win probability
+                                    if not current_game.get("team1_probability"):
+                                        current_game["team1_probability"] = pct
+                                    elif not current_game.get("team2_probability"):
+                                        current_game["team2_probability"] = pct
                 except:
                     pass
             
-            if "Q" in line or "HALFTIME" in line:
+            # Extract quarter/time info
+            if "Q" in line or "HALFTIME" in line or "OT" in line:
                 if "HALFTIME" in line:
                     current_game["quarter"] = "HALFTIME"
+                elif "OT" in line:
+                    current_game["quarter"] = "OT"
                 elif "Q" in line:
                     q_parts = line.split("Q")
                     if len(q_parts) > 1:
@@ -653,10 +700,14 @@ def parse_kalshi_calendar_content(content: str) -> List[Dict[str, Any]]:
                         if time_part:
                             current_game["time"] = time_part
     
+    # Add final game
     if current_game and current_game.get("teams"):
-        games.append(current_game)
+        if game_status == "LIVE":
+            result["live_games"].append(current_game)
+        elif game_status == "UPCOMING":
+            result["upcoming_games"].append(current_game)
     
-    return games
+    return result
 
 
 def generate_alpha_insight_with_llm(game_info: Dict[str, Any], market_data: Dict[str, Any], orderbook: Dict[str, Any], use_search: bool = True) -> str:
@@ -809,37 +860,49 @@ def check_parallel_monitors():
                     alert_msg = f"🔄 Parallel Monitor: {monitor.get('name', monitor_id)}\n"
                     
                     if monitor.get("type") == "kalshi_calendar":
-                        games = parse_kalshi_calendar_content(content)
-                        if games:
-                            alert_msg += f"\n🎮 {len(games)} Live Games Detected:\n\n"
+                        games_data = parse_kalshi_calendar_content(content)
+                        live_games = games_data.get("live_games", [])
+                        upcoming_games = games_data.get("upcoming_games", [])
+                        
+                        # Format LIVE GAMES with scores and probabilities
+                        if live_games:
+                            alert_msg += f"\n🔥 LIVE GAMES ({len(live_games)}):\n\n"
                             
-                            for game in games[:10]:
+                            for game in live_games[:15]:
                                 teams_str = " vs ".join(game.get("teams", ["Unknown"]))
                                 sport = game.get("sport", "Unknown Sport")
                                 quarter = game.get("quarter", "Unknown")
                                 
                                 alert_msg += f"  {sport}: {teams_str}\n"
-                                alert_msg += f"    Status: {quarter}"
+                                
+                                # SCORE (most important for live games)
+                                if game.get("score"):
+                                    alert_msg += f"    📊 Score: {game['score']}\n"
+                                else:
+                                    alert_msg += f"    📊 Score: Not available\n"
+                                
+                                # STATUS
+                                alert_msg += f"    ⏱️  Status: {quarter}"
                                 if game.get("time"):
                                     alert_msg += f" - {game['time']}"
                                 alert_msg += "\n"
                                 
-                                yes_prob = game.get("yes_probability")
-                                no_prob = game.get("no_probability")
-                                if yes_prob or no_prob:
-                                    alert_msg += f"    Kalshi Calendar Shows: "
-                                    if yes_prob:
-                                        alert_msg += f"Yes {yes_prob}%"
-                                    if yes_prob and no_prob:
-                                        alert_msg += " | "
-                                    if no_prob:
-                                        alert_msg += f"No {no_prob}%"
-                                    alert_msg += "\n"
+                                # PROBABILITIES - Calendar probabilities
+                                calendar_probs = []
+                                if game.get("yes_probability"):
+                                    calendar_probs.append(f"Yes: {game['yes_probability']}%")
+                                if game.get("no_probability"):
+                                    calendar_probs.append(f"No: {game['no_probability']}%")
+                                if game.get("team1_probability") and game.get("team2_probability"):
+                                    calendar_probs.append(f"{game['teams'][0]}: {game['team1_probability']}% | {game['teams'][1]}: {game['team2_probability']}%")
                                 
+                                if calendar_probs:
+                                    alert_msg += f"    📈 Calendar Probabilities: {', '.join(calendar_probs)}\n"
+                                
+                                # PROBABILITIES - Kalshi API market prices
                                 if game.get("teams") and kalshi_api:
                                     try:
-                                        search_query = " ".join(game.get("teams", [])[:2])
-                                        markets_resp = kalshi_api.get_markets(limit=20)
+                                        markets_resp = kalshi_api.get_markets(limit=50)
                                         markets = markets_resp.get("markets", [])
                                         markets = filter_active_markets(markets)
                                         
@@ -853,19 +916,82 @@ def check_parallel_monitors():
                                             ticker = market.get("ticker")
                                             orderbook = kalshi_api.get_orderbook(ticker)
                                             
-                                            alpha = generate_alpha_insight_with_llm(game, market, orderbook, use_search=True)
-                                            if alpha:
-                                                alert_msg += f"    {alpha}\n"
-                                            else:
-                                                yes_bids = orderbook.get("yes_bids", [])
-                                                yes_asks = orderbook.get("yes_asks", [])
-                                                if yes_bids and yes_asks:
-                                                    market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
-                                                    alert_msg += f"    Market Price: {market_prob:.0f}% (ticker: {ticker})\n"
+                                            yes_bids = orderbook.get("yes_bids", [])
+                                            yes_asks = orderbook.get("yes_asks", [])
+                                            if yes_bids and yes_asks:
+                                                market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+                                                spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
+                                                alert_msg += f"    💰 Kalshi Market: {market_prob:.1f}% Yes (ticker: {ticker}, spread: {spread:.1f}¢)\n"
+                                                
+                                                # Alpha detection
+                                                alpha = generate_alpha_insight_with_llm(game, market, orderbook, use_search=True)
+                                                if alpha:
+                                                    alert_msg += f"    {alpha}\n"
+                                        else:
+                                            alert_msg += f"    💰 Kalshi Market: No matching market found\n"
                                     except Exception as e:
-                                        logger.warning(f"[PARALLEL] Failed to compare game with market: {e}")
+                                        logger.warning(f"[PARALLEL] Failed to get market data: {e}")
+                                        alert_msg += f"    💰 Kalshi Market: Error fetching data\n"
                                 
                                 alert_msg += "\n"
+                        
+                        # Format UPCOMING GAMES with times and probabilities
+                        if upcoming_games:
+                            alert_msg += f"\n⏰ UPCOMING GAMES ({len(upcoming_games)}):\n\n"
+                            
+                            for game in upcoming_games[:15]:
+                                teams_str = " vs ".join(game.get("teams", ["Unknown"]))
+                                sport = game.get("sport", "Unknown Sport")
+                                start_time = game.get("start_time", "Time TBD")
+                                
+                                alert_msg += f"  {sport}: {teams_str}\n"
+                                alert_msg += f"    ⏰ Start Time: {start_time}\n"
+                                
+                                # PROBABILITIES - Calendar probabilities
+                                calendar_probs = []
+                                if game.get("yes_probability"):
+                                    calendar_probs.append(f"Yes: {game['yes_probability']}%")
+                                if game.get("no_probability"):
+                                    calendar_probs.append(f"No: {game['no_probability']}%")
+                                if game.get("team1_probability") and game.get("team2_probability"):
+                                    calendar_probs.append(f"{game['teams'][0]}: {game['team1_probability']}% | {game['teams'][1]}: {game['team2_probability']}%")
+                                
+                                if calendar_probs:
+                                    alert_msg += f"    📈 Calendar Probabilities: {', '.join(calendar_probs)}\n"
+                                
+                                # PROBABILITIES - Kalshi API market prices
+                                if game.get("teams") and kalshi_api:
+                                    try:
+                                        markets_resp = kalshi_api.get_markets(limit=50)
+                                        markets = markets_resp.get("markets", [])
+                                        markets = filter_active_markets(markets)
+                                        
+                                        matching_markets = [
+                                            m for m in markets
+                                            if any(team.lower() in (m.get("title") or "").lower() for team in game.get("teams", []))
+                                        ]
+                                        
+                                        if matching_markets:
+                                            market = matching_markets[0]
+                                            ticker = market.get("ticker")
+                                            orderbook = kalshi_api.get_orderbook(ticker)
+                                            
+                                            yes_bids = orderbook.get("yes_bids", [])
+                                            yes_asks = orderbook.get("yes_asks", [])
+                                            if yes_bids and yes_asks:
+                                                market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+                                                spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
+                                                alert_msg += f"    💰 Kalshi Market: {market_prob:.1f}% Yes (ticker: {ticker}, spread: {spread:.1f}¢)\n"
+                                        else:
+                                            alert_msg += f"    💰 Kalshi Market: No matching market found\n"
+                                    except Exception as e:
+                                        logger.warning(f"[PARALLEL] Failed to get market data: {e}")
+                                        alert_msg += f"    💰 Kalshi Market: Error fetching data\n"
+                                
+                                alert_msg += "\n"
+                        
+                        if not live_games and not upcoming_games:
+                            alert_msg += "\n⚠️ No games found in calendar data\n"
                     
                     PARALLEL_ALERTS.append({
                         "monitor_id": monitor_id,
@@ -922,37 +1048,49 @@ def check_single_parallel_monitor(monitor_id: str):
                 alert_msg = f"🔄 Parallel Monitor: {monitor.get('name', monitor_id)}\n"
                 
                 if monitor.get("type") == "kalshi_calendar":
-                    games = parse_kalshi_calendar_content(content)
-                    if games:
-                        alert_msg += f"\n🎮 {len(games)} Live Games Detected:\n\n"
+                    games_data = parse_kalshi_calendar_content(content)
+                    live_games = games_data.get("live_games", [])
+                    upcoming_games = games_data.get("upcoming_games", [])
+                    
+                    # Format LIVE GAMES with scores and probabilities
+                    if live_games:
+                        alert_msg += f"\n🔥 LIVE GAMES ({len(live_games)}):\n\n"
                         
-                        for game in games[:10]:
+                        for game in live_games[:15]:
                             teams_str = " vs ".join(game.get("teams", ["Unknown"]))
                             sport = game.get("sport", "Unknown Sport")
                             quarter = game.get("quarter", "Unknown")
                             
                             alert_msg += f"  {sport}: {teams_str}\n"
-                            alert_msg += f"    Status: {quarter}"
+                            
+                            # SCORE (most important for live games)
+                            if game.get("score"):
+                                alert_msg += f"    📊 Score: {game['score']}\n"
+                            else:
+                                alert_msg += f"    📊 Score: Not available\n"
+                            
+                            # STATUS
+                            alert_msg += f"    ⏱️  Status: {quarter}"
                             if game.get("time"):
                                 alert_msg += f" - {game['time']}"
                             alert_msg += "\n"
                             
-                            yes_prob = game.get("yes_probability")
-                            no_prob = game.get("no_probability")
-                            if yes_prob or no_prob:
-                                alert_msg += f"    Kalshi Calendar Shows: "
-                                if yes_prob:
-                                    alert_msg += f"Yes {yes_prob}%"
-                                if yes_prob and no_prob:
-                                    alert_msg += " | "
-                                if no_prob:
-                                    alert_msg += f"No {no_prob}%"
-                                alert_msg += "\n"
+                            # PROBABILITIES - Calendar probabilities
+                            calendar_probs = []
+                            if game.get("yes_probability"):
+                                calendar_probs.append(f"Yes: {game['yes_probability']}%")
+                            if game.get("no_probability"):
+                                calendar_probs.append(f"No: {game['no_probability']}%")
+                            if game.get("team1_probability") and game.get("team2_probability"):
+                                calendar_probs.append(f"{game['teams'][0]}: {game['team1_probability']}% | {game['teams'][1]}: {game['team2_probability']}%")
                             
+                            if calendar_probs:
+                                alert_msg += f"    📈 Calendar Probabilities: {', '.join(calendar_probs)}\n"
+                            
+                            # PROBABILITIES - Kalshi API market prices
                             if game.get("teams") and kalshi_api:
                                 try:
-                                    search_query = " ".join(game.get("teams", [])[:2])
-                                    markets_resp = kalshi_api.get_markets(limit=20)
+                                    markets_resp = kalshi_api.get_markets(limit=50)
                                     markets = markets_resp.get("markets", [])
                                     markets = filter_active_markets(markets)
                                     
@@ -966,19 +1104,82 @@ def check_single_parallel_monitor(monitor_id: str):
                                         ticker = market.get("ticker")
                                         orderbook = kalshi_api.get_orderbook(ticker)
                                         
-                                        alpha = generate_alpha_insight_with_llm(game, market, orderbook, use_search=True)
-                                        if alpha:
-                                            alert_msg += f"    {alpha}\n"
-                                        else:
-                                            yes_bids = orderbook.get("yes_bids", [])
-                                            yes_asks = orderbook.get("yes_asks", [])
-                                            if yes_bids and yes_asks:
-                                                market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
-                                                alert_msg += f"    Market Price: {market_prob:.0f}% (ticker: {ticker})\n"
+                                        yes_bids = orderbook.get("yes_bids", [])
+                                        yes_asks = orderbook.get("yes_asks", [])
+                                        if yes_bids and yes_asks:
+                                            market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+                                            spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
+                                            alert_msg += f"    💰 Kalshi Market: {market_prob:.1f}% Yes (ticker: {ticker}, spread: {spread:.1f}¢)\n"
+                                            
+                                            # Alpha detection
+                                            alpha = generate_alpha_insight_with_llm(game, market, orderbook, use_search=True)
+                                            if alpha:
+                                                alert_msg += f"    {alpha}\n"
+                                    else:
+                                        alert_msg += f"    💰 Kalshi Market: No matching market found\n"
                                 except Exception as e:
-                                    logger.warning(f"[PARALLEL] Failed to compare game with market: {e}")
+                                    logger.warning(f"[PARALLEL] Failed to get market data: {e}")
+                                    alert_msg += f"    💰 Kalshi Market: Error fetching data\n"
                             
                             alert_msg += "\n"
+                    
+                    # Format UPCOMING GAMES with times and probabilities
+                    if upcoming_games:
+                        alert_msg += f"\n⏰ UPCOMING GAMES ({len(upcoming_games)}):\n\n"
+                        
+                        for game in upcoming_games[:15]:
+                            teams_str = " vs ".join(game.get("teams", ["Unknown"]))
+                            sport = game.get("sport", "Unknown Sport")
+                            start_time = game.get("start_time", "Time TBD")
+                            
+                            alert_msg += f"  {sport}: {teams_str}\n"
+                            alert_msg += f"    ⏰ Start Time: {start_time}\n"
+                            
+                            # PROBABILITIES - Calendar probabilities
+                            calendar_probs = []
+                            if game.get("yes_probability"):
+                                calendar_probs.append(f"Yes: {game['yes_probability']}%")
+                            if game.get("no_probability"):
+                                calendar_probs.append(f"No: {game['no_probability']}%")
+                            if game.get("team1_probability") and game.get("team2_probability"):
+                                calendar_probs.append(f"{game['teams'][0]}: {game['team1_probability']}% | {game['teams'][1]}: {game['team2_probability']}%")
+                            
+                            if calendar_probs:
+                                alert_msg += f"    📈 Calendar Probabilities: {', '.join(calendar_probs)}\n"
+                            
+                            # PROBABILITIES - Kalshi API market prices
+                            if game.get("teams") and kalshi_api:
+                                try:
+                                    markets_resp = kalshi_api.get_markets(limit=50)
+                                    markets = markets_resp.get("markets", [])
+                                    markets = filter_active_markets(markets)
+                                    
+                                    matching_markets = [
+                                        m for m in markets
+                                        if any(team.lower() in (m.get("title") or "").lower() for team in game.get("teams", []))
+                                    ]
+                                    
+                                    if matching_markets:
+                                        market = matching_markets[0]
+                                        ticker = market.get("ticker")
+                                        orderbook = kalshi_api.get_orderbook(ticker)
+                                        
+                                        yes_bids = orderbook.get("yes_bids", [])
+                                        yes_asks = orderbook.get("yes_asks", [])
+                                        if yes_bids and yes_asks:
+                                            market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+                                            spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
+                                            alert_msg += f"    💰 Kalshi Market: {market_prob:.1f}% Yes (ticker: {ticker}, spread: {spread:.1f}¢)\n"
+                                    else:
+                                        alert_msg += f"    💰 Kalshi Market: No matching market found\n"
+                                except Exception as e:
+                                    logger.warning(f"[PARALLEL] Failed to get market data: {e}")
+                                    alert_msg += f"    💰 Kalshi Market: Error fetching data\n"
+                            
+                            alert_msg += "\n"
+                    
+                    if not live_games and not upcoming_games:
+                        alert_msg += "\n⚠️ No games found in calendar data\n"
                 
                 PARALLEL_ALERTS.append({
                     "monitor_id": monitor_id,
@@ -1831,18 +2032,48 @@ def check_parallel_monitor(monitor_id: str) -> str:
             content = result["results"][0].get("full_content", "")
             
             if monitor.get("type") == "kalshi_calendar":
-                games = parse_kalshi_calendar_content(content)
-                response = f"✅ Checked {monitor.get('name')}\n\n"
-                response += f"Found {len(games)} live games:\n\n"
+                games_data = parse_kalshi_calendar_content(content)
+                live_games = games_data.get("live_games", [])
+                upcoming_games = games_data.get("upcoming_games", [])
                 
-                for game in games[:5]:
-                    teams_str = " vs ".join(game.get("teams", ["Unknown"]))
-                    response += f"• {game.get('sport', 'Unknown')}: {teams_str}\n"
-                    if game.get("quarter"):
-                        response += f"  Status: {game['quarter']}\n"
-                    if game.get("yes_probability"):
-                        response += f"  Yes: {game['yes_probability']}%\n"
-                    response += "\n"
+                response = f"✅ Checked {monitor.get('name')}\n\n"
+                
+                if live_games:
+                    response += f"🔥 LIVE GAMES ({len(live_games)}):\n\n"
+                    for game in live_games[:10]:
+                        teams_str = " vs ".join(game.get("teams", ["Unknown"]))
+                        response += f"• {game.get('sport', 'Unknown')}: {teams_str}\n"
+                        if game.get("score"):
+                            response += f"  📊 Score: {game['score']}\n"
+                        if game.get("quarter"):
+                            response += f"  ⏱️  Status: {game['quarter']}\n"
+                        if game.get("yes_probability") or game.get("no_probability"):
+                            probs = []
+                            if game.get("yes_probability"):
+                                probs.append(f"Yes: {game['yes_probability']}%")
+                            if game.get("no_probability"):
+                                probs.append(f"No: {game['no_probability']}%")
+                            response += f"  📈 Probabilities: {', '.join(probs)}\n"
+                        response += "\n"
+                
+                if upcoming_games:
+                    response += f"\n⏰ UPCOMING GAMES ({len(upcoming_games)}):\n\n"
+                    for game in upcoming_games[:10]:
+                        teams_str = " vs ".join(game.get("teams", ["Unknown"]))
+                        response += f"• {game.get('sport', 'Unknown')}: {teams_str}\n"
+                        if game.get("start_time"):
+                            response += f"  ⏰ Start: {game['start_time']}\n"
+                        if game.get("yes_probability") or game.get("no_probability"):
+                            probs = []
+                            if game.get("yes_probability"):
+                                probs.append(f"Yes: {game['yes_probability']}%")
+                            if game.get("no_probability"):
+                                probs.append(f"No: {game['no_probability']}%")
+                            response += f"  📈 Probabilities: {', '.join(probs)}\n"
+                        response += "\n"
+                
+                if not live_games and not upcoming_games:
+                    response += "⚠️ No games found\n"
                 
                 return response
             else:
