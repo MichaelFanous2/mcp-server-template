@@ -141,15 +141,31 @@ class KalshiAPI:
         params = {"limit": limit, **kwargs}
         return self._request("GET", "/markets", params=params)
     
-    def get_orderbook(self, ticker: str) -> Dict[str, Any]:
-        """Get orderbook for a market. Returns the orderbook data structure."""
-        result = self._request("GET", f"/markets/{ticker}/orderbook")
-        # The API might return the orderbook directly or nested
-        # Check if it's nested under "orderbook" key
+    def get_orderbook(self, ticker: str, depth: int = 0) -> Dict[str, Any]:
+        """Get orderbook for a market. Returns the orderbook data structure.
+        
+        Args:
+            ticker: Market ticker
+            depth: Depth of orderbook (0 = all levels, 1-100 for specific depth)
+        """
+        params = {"depth": depth} if depth > 0 else {}
+        result = self._request("GET", f"/markets/{ticker}/orderbook", params=params)
+        # API returns: {"orderbook": {"yes": [[price, size], ...], "no": [[price, size], ...], ...}}
         if isinstance(result, dict) and "orderbook" in result:
             return result["orderbook"]
-        # Otherwise return the result as-is (it might already be the orderbook)
         return result
+    
+    def get_trades(self, limit: int = 100, cursor: Optional[str] = None) -> Dict[str, Any]:
+        """Get recent trades for all markets.
+        
+        Args:
+            limit: Number of results per page (1-1000, default 100)
+            cursor: Pagination cursor from previous response
+        """
+        params = {"limit": min(limit, 1000)}
+        if cursor:
+            params["cursor"] = cursor
+        return self._request("GET", "/markets/trades", params=params)
     
     def get_market(self, ticker: str) -> Dict[str, Any]:
         return self._request("GET", f"/markets/{ticker}")
@@ -190,6 +206,9 @@ KALSHI_RATE_LIMIT = 20
 PARALLEL_MONITORS: Dict[str, Dict[str, Any]] = {}
 PARALLEL_MONITORS_FILE = Path("/tmp/parallel_monitors.json")
 PARALLEL_ALERTS: List[Dict[str, Any]] = []
+
+KALSHI_TRADE_HISTORY: Dict[str, List[Dict[str, Any]]] = {}  # ticker -> list of trades
+KALSHI_TRADE_SURGES: List[Dict[str, Any]] = []  # Recent surge alerts
 
 
 # =========================
@@ -616,9 +635,19 @@ def save_parallel_monitors():
 
 
 def format_kalshi_odds(orderbook: Dict[str, Any], ticker: str) -> str:
-    """Format Kalshi orderbook data into readable odds/probabilities with bid/ask prices and volumes."""
-    # get_orderbook() already unwraps nested structures, so orderbook should be flat
-    # But handle both cases just in case
+    """Format Kalshi orderbook data into readable odds/probabilities with bid/ask prices and volumes.
+    
+    Kalshi API orderbook structure (from docs):
+    {
+      "orderbook": {
+        "yes": [[price, size], ...],  // Array of [price, size] arrays
+        "no": [[price, size], ...],
+        "yes_dollars": [["0.1500", size], ...],
+        "no_dollars": [["0.1500", size], ...]
+      }
+    }
+    """
+    # get_orderbook() already unwraps nested structures, so orderbook should be the inner structure
     original_orderbook = orderbook
     if isinstance(orderbook, dict) and "orderbook" in orderbook:
         orderbook = orderbook["orderbook"]
@@ -627,60 +656,92 @@ def format_kalshi_odds(orderbook: Dict[str, Any], ticker: str) -> str:
         logger.error(f"[KALSHI] Invalid orderbook structure for {ticker}: {type(orderbook)}")
         return f"    💰 Kalshi Market: Invalid orderbook data (ticker: {ticker})\n"
     
-    # Kalshi API returns: yes_bids, yes_asks, no_bids, no_asks as arrays of {price, size} objects
-    yes_bids = orderbook.get("yes_bids", [])
-    yes_asks = orderbook.get("yes_asks", [])
-    no_bids = orderbook.get("no_bids", [])
-    no_asks = orderbook.get("no_asks", [])
+    # Kalshi API structure (from official docs):
+    # - "yes": array of [price, size] for YES BIDS ONLY, sorted ascending (lowest to highest)
+    # - "no": array of [price, size] for NO BIDS ONLY, sorted ascending (lowest to highest)
+    # - Best YES bid = last element of yes array (highest price)
+    # - Best NO bid = last element of no array (highest price)
+    # - Best YES ask = 100 - (best NO bid price) [calculated from opposite side]
+    # - Best NO ask = 100 - (best YES bid price) [calculated from opposite side]
     
-    # If not found, try nested "yes" and "no" structures (alternative format)
-    if not yes_bids and "yes" in orderbook:
-        yes_data = orderbook["yes"]
-        if isinstance(yes_data, dict):
-            yes_bids = yes_data.get("bids", yes_data.get("yes_bids", []))
-            yes_asks = yes_data.get("asks", yes_data.get("yes_asks", []))
-        elif isinstance(yes_data, list):
-            yes_bids = yes_data
+    yes_bids_raw = orderbook.get("yes", [])
+    no_bids_raw = orderbook.get("no", [])
     
-    if not no_bids and "no" in orderbook:
-        no_data = orderbook["no"]
-        if isinstance(no_data, dict):
-            no_bids = no_data.get("bids", no_data.get("no_bids", []))
-            no_asks = no_data.get("asks", no_data.get("no_asks", []))
-        elif isinstance(no_data, list):
-            no_bids = no_data
+    # Parse YES bids: array is sorted ascending, last element is best bid
+    yes_bids = []
+    if yes_bids_raw:
+        for order in yes_bids_raw:
+            if isinstance(order, list) and len(order) >= 1:
+                try:
+                    price = int(order[0]) if len(order) > 0 else 0
+                    size = int(order[1]) if len(order) > 1 else 0
+                    if 0 < price <= 100:
+                        yes_bids.append({"price": price, "size": size})
+                except (ValueError, TypeError):
+                    continue
+        # Sort ascending (API should already be sorted, but ensure it)
+        yes_bids.sort(key=lambda x: x["price"])
     
-    # Log what we found for debugging
-    logger.info(f"[KALSHI DEBUG] format_kalshi_odds for {ticker} - yes_bids: {len(yes_bids) if yes_bids else 0}, yes_asks: {len(yes_asks) if yes_asks else 0}, no_bids: {len(no_bids) if no_bids else 0}, no_asks: {len(no_asks) if no_asks else 0}")
+    # Parse NO bids: same structure
+    no_bids = []
+    if no_bids_raw:
+        for order in no_bids_raw:
+            if isinstance(order, list) and len(order) >= 1:
+                try:
+                    price = int(order[0]) if len(order) > 0 else 0
+                    size = int(order[1]) if len(order) > 1 else 0
+                    if 0 < price <= 100:
+                        no_bids.append({"price": price, "size": size})
+                except (ValueError, TypeError):
+                    continue
+        no_bids.sort(key=lambda x: x["price"])
+    
+    # Calculate asks from opposite side bids
+    # Best YES ask = 100 - (best NO bid)
+    # Best NO ask = 100 - (best YES bid)
+    yes_asks = []
+    no_asks = []
+    
+    if no_bids:
+        best_no_bid_price = no_bids[-1]["price"]  # Last element = highest bid
+        best_yes_ask_price = 100 - best_no_bid_price
+        # Use the size from the corresponding NO bid
+        best_no_bid_size = no_bids[-1]["size"]
+        yes_asks.append({"price": best_yes_ask_price, "size": best_no_bid_size})
+    
+    if yes_bids:
+        best_yes_bid_price = yes_bids[-1]["price"]  # Last element = highest bid
+        best_no_ask_price = 100 - best_yes_bid_price
+        best_yes_bid_size = yes_bids[-1]["size"]
+        no_asks.append({"price": best_no_ask_price, "size": best_yes_bid_size})
+    
+    # Log what we found
+    logger.info(f"[KALSHI DEBUG] format_kalshi_odds for {ticker} - yes_bids: {len(yes_bids)}, yes_asks: {len(yes_asks)}, no_bids: {len(no_bids)}, no_asks: {len(no_asks)}")
     
     if not yes_bids or not yes_asks:
-        # Log the full structure for debugging
-        logger.warning(f"[KALSHI] No orderbook data for {ticker} - checking structure...")
-        logger.warning(f"[KALSHI DEBUG] Orderbook top-level keys: {list(original_orderbook.keys()) if isinstance(original_orderbook, dict) else 'Not a dict'}")
-        logger.warning(f"[KALSHI DEBUG] Orderbook data keys: {list(orderbook.keys())}")
-        # Try to show a sample of the structure
+        logger.warning(f"[KALSHI] No orderbook data for {ticker} - yes_orders: {len(yes_orders)}, no_orders: {len(no_orders)}")
         if isinstance(orderbook, dict):
-            sample = {k: str(v)[:100] for k, v in list(orderbook.items())[:5]}
-            logger.warning(f"[KALSHI DEBUG] Orderbook sample: {sample}")
+            logger.warning(f"[KALSHI DEBUG] Orderbook keys: {list(orderbook.keys())}")
         return f"    💰 Kalshi Market: No active orderbook (ticker: {ticker}) - Market may not have liquidity yet\n"
     
-    yes_bid_price = yes_bids[0].get("price", 0)
-    yes_ask_price = yes_asks[0].get("price", 100)
+    # Get best bid (highest) and best ask (lowest)
+    yes_bid_price = yes_bids[0]["price"] if yes_bids else 0
+    yes_ask_price = yes_asks[0]["price"] if yes_asks else 100
     yes_mid = (yes_bid_price + yes_ask_price) / 2
     yes_spread = yes_ask_price - yes_bid_price
-    yes_bid_vol = yes_bids[0].get("size", 0)
-    yes_ask_vol = yes_asks[0].get("size", 0)
+    yes_bid_vol = yes_bids[0]["size"] if yes_bids else 0
+    yes_ask_vol = yes_asks[0]["size"] if yes_asks else 0
     
     result = f"    💰 Kalshi Live Odds (ticker: {ticker}):\n"
     result += f"      ✅ YES: {yes_mid:.1f}% (bid: {yes_bid_price}¢ @ {yes_bid_vol} contracts, ask: {yes_ask_price}¢ @ {yes_ask_vol} contracts, spread: {yes_spread:.1f}¢)\n"
     
     if no_bids and no_asks:
-        no_bid_price = no_bids[0].get("price", 0)
-        no_ask_price = no_asks[0].get("price", 100)
+        no_bid_price = no_bids[0]["price"]
+        no_ask_price = no_asks[0]["price"]
         no_mid = (no_bid_price + no_ask_price) / 2
         no_spread = no_ask_price - no_bid_price
-        no_bid_vol = no_bids[0].get("size", 0)
-        no_ask_vol = no_asks[0].get("size", 0)
+        no_bid_vol = no_bids[0]["size"]
+        no_ask_vol = no_asks[0]["size"]
         result += f"      ❌ NO: {no_mid:.1f}% (bid: {no_bid_price}¢ @ {no_bid_vol} contracts, ask: {no_ask_price}¢ @ {no_ask_vol} contracts, spread: {no_spread:.1f}¢)\n"
     else:
         # Calculate No from Yes (should be ~100 - Yes)
@@ -688,6 +749,102 @@ def format_kalshi_odds(orderbook: Dict[str, Any], ticker: str) -> str:
         result += f"      ❌ NO: ~{no_prob:.1f}% (derived from Yes price)\n"
     
     return result
+
+
+def detect_trade_surges(min_trades: int = 10, time_window_minutes: int = 5) -> List[Dict[str, Any]]:
+    """Detect markets with surge in trading activity.
+    
+    Args:
+        min_trades: Minimum number of trades in time window to consider a surge
+        time_window_minutes: Time window to check for surges
+    
+    Returns:
+        List of markets with surge activity
+    """
+    if not kalshi_api:
+        return []
+    
+    try:
+        # Get recent trades
+        trades_response = kalshi_api.get_trades(limit=500)
+        trades = trades_response.get("trades", [])
+        
+        if not trades:
+            return []
+        
+        # Group trades by ticker and count recent ones
+        now = datetime.now()
+        window_start = now.timestamp() - (time_window_minutes * 60)
+        
+        ticker_counts: Dict[str, Dict[str, Any]] = {}
+        
+        for trade in trades:
+            ticker = trade.get("ticker")
+            if not ticker:
+                continue
+            
+            created_time = trade.get("created_time")
+            if created_time:
+                try:
+                    if isinstance(created_time, str):
+                        trade_time = datetime.fromisoformat(created_time.replace("Z", "+00:00"))
+                    else:
+                        trade_time = created_time
+                    
+                    # Check if trade is within time window
+                    trade_timestamp = trade_time.timestamp()
+                    if trade_timestamp < window_start:
+                        continue
+                    
+                    if ticker not in ticker_counts:
+                        ticker_counts[ticker] = {
+                            "count": 0,
+                            "total_volume": 0,
+                            "recent_trades": [],
+                            "market_title": None
+                        }
+                    
+                    ticker_counts[ticker]["count"] += 1
+                    ticker_counts[ticker]["total_volume"] += trade.get("count", 0)
+                    ticker_counts[ticker]["recent_trades"].append(trade)
+                    
+                    if not ticker_counts[ticker]["market_title"]:
+                        # Try to get market title from trade or fetch it
+                        ticker_counts[ticker]["market_title"] = trade.get("ticker", ticker)
+                except Exception as e:
+                    logger.warning(f"[KALSHI] Failed to parse trade time: {e}")
+                    continue
+        
+        # Filter to only markets with surge (above threshold)
+        surges = []
+        for ticker, data in ticker_counts.items():
+            if data["count"] >= min_trades:
+                # Get market info if available
+                market_title = data["market_title"]
+                try:
+                    market_data = kalshi_api.get_market(ticker)
+                    market_title = market_data.get("title", ticker)
+                except:
+                    pass
+                
+                surges.append({
+                    "ticker": ticker,
+                    "title": market_title,
+                    "trade_count": data["count"],
+                    "total_volume": data["total_volume"],
+                    "time_window_minutes": time_window_minutes,
+                    "detected_at": now.isoformat(),
+                    "recent_trades": data["recent_trades"][:10]  # Keep top 10 for reference
+                })
+        
+        # Sort by trade count descending
+        surges.sort(key=lambda x: x["trade_count"], reverse=True)
+        
+        return surges
+    
+    except Exception as e:
+        logger.error(f"[KALSHI] Failed to detect trade surges: {e}")
+        return []
 
 
 def parse_kalshi_calendar_content(content: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -2007,6 +2164,69 @@ def get_kalshi_risk_analysis(ticker: str) -> str:
         return result
     except Exception as e:
         return f"Error getting risk analysis: {str(e)}"
+
+
+@mcp.tool(description="Detect markets with surge in trading activity (high volume of recent trades)")
+def detect_kalshi_trade_surges(min_trades: int = 10, time_window_minutes: int = 5) -> str:
+    """Detect markets experiencing a surge in trading activity based on recent trade volume."""
+    logger.info(f"[MCP TOOL] detect_kalshi_trade_surges called - min_trades: {min_trades}, time_window: {time_window_minutes}min")
+    if not kalshi_api:
+        return "Error: Kalshi API not configured."
+    
+    try:
+        surges = detect_trade_surges(min_trades=min_trades, time_window_minutes=time_window_minutes)
+        
+        if not surges:
+            return f"No trade surges detected in the last {time_window_minutes} minutes (minimum {min_trades} trades required)."
+        
+        result = f"🚨 Trade Surges Detected ({len(surges)} markets):\n\n"
+        result += f"Time Window: Last {time_window_minutes} minutes\n"
+        result += f"Minimum Trades: {min_trades}\n\n"
+        
+        for i, surge in enumerate(surges[:20], 1):  # Show top 20
+            result += f"{i}. {surge['ticker']}: {surge['title']}\n"
+            result += f"   📊 {surge['trade_count']} trades | {surge['total_volume']} contracts\n"
+            result += f"   ⏰ Detected: {surge['detected_at']}\n"
+            
+            # Get current market price if available
+            try:
+                orderbook = kalshi_api.get_orderbook(surge['ticker'])
+                odds_str = format_kalshi_odds(orderbook, surge['ticker'])
+                result += odds_str
+            except Exception as e:
+                logger.warning(f"[KALSHI] Failed to get orderbook for {surge['ticker']}: {e}")
+            
+            result += "\n"
+        
+        # Store surges for later retrieval
+        global KALSHI_TRADE_SURGES
+        KALSHI_TRADE_SURGES.extend(surges)
+        # Keep only last 100 surges
+        if len(KALSHI_TRADE_SURGES) > 100:
+            KALSHI_TRADE_SURGES = KALSHI_TRADE_SURGES[-100:]
+        
+        return result
+    except Exception as e:
+        logger.error(f"[KALSHI] Error detecting trade surges: {e}")
+        return f"Error detecting trade surges: {str(e)}"
+
+
+@mcp.tool(description="Get recent trade surge alerts")
+def get_kalshi_trade_surges(limit: int = 10) -> str:
+    """Get recent trade surge alerts that were detected."""
+    logger.info(f"[MCP TOOL] get_kalshi_trade_surges called - limit: {limit}")
+    if not KALSHI_TRADE_SURGES:
+        return "No recent trade surges detected."
+    
+    recent = KALSHI_TRADE_SURGES[-limit:]
+    result = f"Recent Trade Surges ({len(recent)}):\n\n"
+    
+    for surge in recent:
+        result += f"• {surge['ticker']}: {surge['title']}\n"
+        result += f"  {surge['trade_count']} trades in {surge['time_window_minutes']}min | {surge['total_volume']} contracts\n"
+        result += f"  Detected: {surge['detected_at']}\n\n"
+    
+    return result
 
 
 @mcp.tool(description="Create a general Parallel API monitor for any URL(s). Monitor interval is in seconds (e.g., 300 for 5 minutes).")
