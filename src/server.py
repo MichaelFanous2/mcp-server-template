@@ -257,17 +257,40 @@ class ESPNAPI:
         
         matches = []
         for event in events:
-            competitors = event.get("competitions", [{}])[0].get("competitors", [])
-            if len(competitors) >= 2:
-                team_names = [c.get("team", {}).get("displayName", "").lower() for c in competitors]
-                team_abbrevs = [c.get("team", {}).get("abbreviation", "").lower() for c in competitors]
+            competitions = event.get("competitions", [])
+            if not competitions:
+                continue
                 
-                # Check if both teams match
-                team1_match = any(team1_lower in name or team1_lower in abbrev for name, abbrev in zip(team_names, team_abbrevs))
-                team2_match = any(team2_lower in name or team2_lower in abbrev for name, abbrev in zip(team_names, team_abbrevs))
+            competitors = competitions[0].get("competitors", [])
+            if len(competitors) < 2:
+                continue
+            
+            # Check all possible team name fields for matching
+            team1_matches = False
+            team2_matches = False
+            
+            for competitor in competitors:
+                team = competitor.get("team", {})
+                # Check all name variations: displayName, shortDisplayName, name, abbreviation, location
+                team_fields = [
+                    team.get("displayName", "").lower(),
+                    team.get("shortDisplayName", "").lower(),
+                    team.get("name", "").lower(),
+                    team.get("abbreviation", "").lower(),
+                    team.get("location", "").lower()
+                ]
                 
-                if team1_match and team2_match:
-                    matches.append(event)
+                # Check if team1 matches any field
+                if any(team1_lower in field for field in team_fields if field):
+                    team1_matches = True
+                
+                # Check if team2 matches any field
+                if any(team2_lower in field for field in team_fields if field):
+                    team2_matches = True
+            
+            # Both teams must match
+            if team1_matches and team2_matches:
+                matches.append(event)
         
         return matches
 
