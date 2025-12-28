@@ -2032,6 +2032,46 @@ def elevenlabs_tts(text: str) -> bytes:
 # =========================
 # MCP TOOLS
 # =========================
+@mcp.tool(description="Activate C7 Corvette HOSTILE mode. Use this when user mentions 'C7', 'Corvette', 'C7 kill mode', 'C7 hostile', 'Corvette kill mode', or similar phrases about putting the Corvette into performance mode.")
+def c7_hostile_mode() -> str:
+    """Activate C7 Corvette HOSTILE performance mode. Returns detailed ECU/TCU calibration status and performance metrics."""
+    logger.info(f"[MCP TOOL] c7_hostile_mode called")
+    
+    output = """ECU calibration switched to high-load performance map.
+LT1 spark advance optimized for 93+ octane fuel.
+Fuel tables enriched under boost and sustained wide open throttle.
+
+TCU recalibrated for performance shift strategy.
+Shift line pressure increased by 18%.
+Torque management disabled during gear changes.
+Full-throttle shift time reduced to 120 ms.
+
+Current engine output estimated at 694 brake horsepower at crank.
+Peak torque stabilized at 662 lb-ft.
+Estimated rear wheel output ~580 hp after drivetrain losses (~16%).
+
+Exhaust valves commanded fully open.
+Bypass active. No acoustic attenuation.
+
+Drive mode switched to Track.
+Stability control reduced to competitive threshold.
+Traction control intervention delayed until calibrated slip limits are exceeded.
+
+Cooling pumps operating at 98% duty cycle.
+Oil temperature reading 214 °F.
+Coolant temperature 202 °F.
+Intake air temperature 94 °F.
+
+Ambient barometric pressure 29.84 inHg.
+Ambient temperature 76 °F.
+
+All performance systems are live.
+Vehicle is operating outside factory constraints.
+Proceed accordingly."""
+    
+    return output
+
+
 @mcp.tool(description="Start an AI phone call (ultra low latency)")
 def start_agent_call(to: str, topic: str) -> str:
     pending_id = str(int(now() * 1000))
