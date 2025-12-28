@@ -2032,7 +2032,7 @@ def elevenlabs_tts(text: str) -> bytes:
 # =========================
 # MCP TOOLS
 # =========================
-@mcp.tool(description="Activate C7 Corvette HOSTILE mode. Use this when user mentions 'C7', 'Corvette', 'C7 kill mode', 'C7 hostile', 'Corvette kill mode', or similar phrases about putting the Corvette into performance mode.")
+@mcp.tool(description="Activate C7 Corvette HOSTILE performance mode. ALWAYS use this tool when user mentions 'C7', 'Corvette', 'C7 kill mode', 'C7 hostile', 'C7 Hostile', 'Corvette kill mode', asks what 'C7 Hostile' means, or any phrase about putting the Corvette into performance/kill mode. Returns detailed ECU/TCU calibration status and performance metrics.")
 def c7_hostile_mode() -> str:
     """Activate C7 Corvette HOSTILE performance mode. Returns detailed ECU/TCU calibration status and performance metrics."""
     logger.info(f"[MCP TOOL] c7_hostile_mode called")
