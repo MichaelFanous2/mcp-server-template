@@ -2264,17 +2264,65 @@ def get_kalshi_market_analysis(ticker: str) -> str:
         
         title = market_data.get('title', 'N/A')
         
-        # Parse Kalshi odds
-        yes_bids = orderbook.get("yes_bids", [])
-        yes_asks = orderbook.get("yes_asks", [])
-        no_bids = orderbook.get("no_bids", [])
-        no_asks = orderbook.get("no_asks", [])
+        # Parse Kalshi odds - orderbook has "yes" and "no" arrays, not "yes_bids"/"yes_asks"
+        # Unwrap nested orderbook if needed
+        if isinstance(orderbook, dict) and "orderbook" in orderbook:
+            orderbook = orderbook["orderbook"]
+        
+        yes_bids_raw = orderbook.get("yes", [])
+        no_bids_raw = orderbook.get("no", [])
+        
+        # Parse YES bids: array is sorted ascending, last element is best bid
+        yes_bids = []
+        if yes_bids_raw:
+            for order in yes_bids_raw:
+                if isinstance(order, list) and len(order) >= 1:
+                    try:
+                        price = int(order[0]) if len(order) > 0 else 0
+                        size = int(order[1]) if len(order) > 1 else 0
+                        if 0 < price <= 100:
+                            yes_bids.append({"price": price, "size": size})
+                    except (ValueError, TypeError):
+                        continue
+            yes_bids.sort(key=lambda x: x["price"])
+        
+        # Parse NO bids: same structure
+        no_bids = []
+        if no_bids_raw:
+            for order in no_bids_raw:
+                if isinstance(order, list) and len(order) >= 1:
+                    try:
+                        price = int(order[0]) if len(order) > 0 else 0
+                        size = int(order[1]) if len(order) > 1 else 0
+                        if 0 < price <= 100:
+                            no_bids.append({"price": price, "size": size})
+                    except (ValueError, TypeError):
+                        continue
+            no_bids.sort(key=lambda x: x["price"])
+        
+        # Calculate asks from opposite side bids
+        # Best YES ask = 100 - (best NO bid)
+        # Best NO ask = 100 - (best YES bid)
+        yes_asks = []
+        no_asks = []
+        
+        if no_bids:
+            best_no_bid_price = no_bids[-1]["price"]  # Last element = highest bid
+            best_yes_ask_price = 100 - best_no_bid_price
+            best_no_bid_size = no_bids[-1]["size"]
+            yes_asks.append({"price": best_yes_ask_price, "size": best_no_bid_size})
+        
+        if yes_bids:
+            best_yes_bid_price = yes_bids[-1]["price"]  # Last element = highest bid
+            best_no_ask_price = 100 - best_yes_bid_price
+            best_yes_bid_size = yes_bids[-1]["size"]
+            no_asks.append({"price": best_no_ask_price, "size": best_yes_bid_size})
         
         # Get best bid/ask
-        yes_bid_price = yes_bids[0].get("price", 0) if yes_bids else 0
-        yes_ask_price = yes_asks[0].get("price", 100) if yes_asks else 100
-        yes_bid_vol = yes_bids[0].get("size", 0) if yes_bids else 0
-        yes_ask_vol = yes_asks[0].get("size", 0) if yes_asks else 0
+        yes_bid_price = yes_bids[-1]["price"] if yes_bids else 0  # Last element = best bid
+        yes_ask_price = yes_asks[0]["price"] if yes_asks else 100  # First element = best ask
+        yes_bid_vol = yes_bids[-1]["size"] if yes_bids else 0
+        yes_ask_vol = yes_asks[0]["size"] if yes_asks else 0
         yes_mid = (yes_bid_price + yes_ask_price) / 2 if yes_bids and yes_asks else (yes_bid_price or yes_ask_price)
         yes_spread = yes_ask_price - yes_bid_price if yes_bids and yes_asks else 0
         
