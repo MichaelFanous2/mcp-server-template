@@ -1185,11 +1185,15 @@ def generate_alpha_insight_with_llm(game_info: Dict[str, Any], market_data: Dict
         quarter = game_info.get('quarter', 'Unknown')
         game_status = quarter
     
-    # Optional: Use Parallel search for additional context
+    # Optional: Use Parallel search for additional context (news/articles)
     search_context = ""
     if use_search and parallel_api and abs(market_yes_prob - game_yes_prob) > 5:
         try:
-            search_query = f"{sport} {teams_str} {quarter} live score"
+            # Use ESPN data for search query if available (more accurate)
+            if espn_data and espn_data.get("status_detail"):
+                search_query = f"{sport} {teams_str} {espn_data['status_detail']}"
+            else:
+                search_query = f"{sport} {teams_str} {game_status} live"
             logger.info(f"[PARALLEL] Searching for game context: '{search_query}'")
             search_results = parallel_api.search(search_query, max_results=3)
             
