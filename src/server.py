@@ -1834,6 +1834,8 @@ I can help you with the following Kalshi prediction market features:
 10. **Live Odds** - Get current bid/ask prices, spreads, and probabilities for any market
 11. **Recent Insights** - View your recent alerts, insights, and market discoveries
 12. **Trade Surge Alerts** - See which markets had recent trading surges
+13. **Live Sports Scores** - Get real-time game scores from ESPN to compare with Kalshi market prices
+14. **Game Score Lookup** - Search for specific games by team names to get current scores
 
 ## 💡 **Smart Features**
 - **AI-Powered Alpha** - Uses LLM reasoning to identify betting opportunities
