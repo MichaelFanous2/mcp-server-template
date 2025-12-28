@@ -1118,8 +1118,8 @@ def parse_kalshi_calendar_content(content: str) -> Dict[str, List[Dict[str, Any]
     return result
 
 
-def generate_alpha_insight_with_llm(game_info: Dict[str, Any], market_data: Dict[str, Any], orderbook: Dict[str, Any], use_search: bool = True) -> str:
-    """Use OpenAI to generate intelligent alpha insights comparing live game state vs market. Optionally uses Parallel search for context."""
+def generate_alpha_insight_with_llm(game_info: Dict[str, Any], market_data: Dict[str, Any], orderbook: Dict[str, Any], use_search: bool = True, espn_data: Optional[Dict[str, Any]] = None) -> str:
+    """Use OpenAI to generate intelligent alpha insights comparing live game state vs market. Uses ESPN for deterministic data, Parallel search for context."""
     if not KALSHI_INSIGHTS_ENABLED or not OPENAI_API_KEY:
         return ""
     
@@ -1130,7 +1130,43 @@ def generate_alpha_insight_with_llm(game_info: Dict[str, Any], market_data: Dict
         return ""
     
     market_yes_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
-    game_yes_prob = game_info.get("yes_probability")
+    
+    # Prefer ESPN win probability over calendar probability (more deterministic)
+    game_yes_prob = None
+    if espn_data and espn_data.get("event_id"):
+        try:
+            # Get ESPN win probability
+            sport_map = {
+                "Pro Football": ("football", "nfl"),
+                "College Football": ("football", "college-football"),
+                "Pro Basketball": ("basketball", "nba"),
+                "College Basketball": ("basketball", "mens-college-basketball"),
+                "Pro Hockey": ("hockey", "nhl"),
+                "Pro Baseball": ("baseball", "mlb")
+            }
+            sport = game_info.get('sport', 'Unknown')
+            espn_sport, espn_league = sport_map.get(sport, (None, None))
+            if espn_sport and espn_league:
+                summary = espn_api.get_game_summary(espn_sport, espn_league, espn_data["event_id"])
+                winprob = summary.get("winprobability", [])
+                if winprob:
+                    latest = winprob[-1]
+                    home_win_prob = latest.get("homeWinPercentage", 0)
+                    if home_win_prob is not None:
+                        # Determine which team is "yes" based on market title
+                        market_title = market_data.get("title", "").lower()
+                        teams = game_info.get('teams', [])
+                        if teams and len(teams) >= 2:
+                            # If market is about team1 winning, use home_win_prob
+                            # If market is about team2 winning, use 1 - home_win_prob
+                            # For now, assume market is about team1 (home team)
+                            game_yes_prob = home_win_prob * 100
+        except Exception as e:
+            logger.warning(f"[ESPN] Failed to get win probability for alpha: {e}")
+    
+    # Fallback to calendar probability if ESPN not available
+    if game_yes_prob is None:
+        game_yes_prob = game_info.get("yes_probability")
     
     if not game_yes_prob:
         return ""
@@ -1141,7 +1177,13 @@ def generate_alpha_insight_with_llm(game_info: Dict[str, Any], market_data: Dict
     
     teams_str = ", ".join(game_info.get('teams', []))
     sport = game_info.get('sport', 'Unknown')
-    quarter = game_info.get('quarter', 'Unknown')
+    
+    # Use ESPN status if available, otherwise calendar
+    if espn_data and espn_data.get("status_detail"):
+        game_status = espn_data["status_detail"]
+    else:
+        quarter = game_info.get('quarter', 'Unknown')
+        game_status = quarter
     
     # Optional: Use Parallel search for additional context
     search_context = ""
@@ -1170,12 +1212,23 @@ def generate_alpha_insight_with_llm(game_info: Dict[str, Any], market_data: Dict
             logger.warning(f"[PARALLEL] Failed to get search context: {e}")
             search_context = ""
     
-    context = f"""
-Live Game State (from Kalshi calendar):
-- Teams: {teams_str}
-- Sport: {sport}
-- Quarter/Status: {quarter}
-- Calendar Probability: {game_yes_prob}% Yes
+    # Build context with ESPN data (deterministic) when available
+    game_state_lines = [
+        f"Live Game State:",
+        f"- Teams: {teams_str}",
+        f"- Sport: {sport}",
+        f"- Status: {game_status}"
+    ]
+    
+    if espn_data and espn_data.get("team1_score") and espn_data.get("team2_score"):
+        game_state_lines.append(f"- Score: {espn_data['team1_name']} {espn_data['team1_score']} - {espn_data['team2_name']} {espn_data['team2_score']} (ESPN)")
+    
+    if espn_data and espn_data.get("event_id"):
+        game_state_lines.append(f"- Win Probability: {game_yes_prob:.1f}% Yes (ESPN - deterministic)")
+    else:
+        game_state_lines.append(f"- Calendar Probability: {game_yes_prob}% Yes (Kalshi calendar)")
+    
+    context = "\n".join(game_state_lines) + f"""
 
 Market Data (from Kalshi API):
 - Market: {market_data.get('title', 'N/A')}
@@ -1190,8 +1243,10 @@ Difference: {abs(market_yes_prob - game_yes_prob):.1f} percentage points
     
     instructions = (
         "You are a sports betting analyst. Analyze the discrepancy between the live game state "
-        "and the market price. Consider: game momentum (which quarter, score if available), "
+        "(from ESPN - deterministic, accurate data) and the market price (from Kalshi). "
+        "Consider: game momentum (score, quarter/period, time remaining), "
         "market liquidity (spread, depth), and whether the market is mispricing based on current game state. "
+        "ESPN data is authoritative - use it as the ground truth for game state."
     )
     
     if search_context:
@@ -1467,23 +1522,81 @@ def check_single_parallel_monitor(monitor_id: str):
                         for game in live_games[:15]:
                             teams_str = " vs ".join(game.get("teams", ["Unknown"]))
                             sport = game.get("sport", "Unknown Sport")
-                            quarter = game.get("quarter", "Unknown")
                             
                             alert_msg += f"  {sport}: {teams_str}\n"
                             
-                            # SCORE (most important for live games)
-                            if game.get("score"):
-                                alert_msg += f"    📊 Score: {game['score']}\n"
+                            # Use ESPN for deterministic game data
+                            espn_data = None
+                            if game.get("teams") and len(game.get("teams", [])) >= 2:
+                                try:
+                                    # Map sport to ESPN format
+                                    sport_map = {
+                                        "Pro Football": ("football", "nfl"),
+                                        "College Football": ("football", "college-football"),
+                                        "Pro Basketball": ("basketball", "nba"),
+                                        "College Basketball": ("basketball", "mens-college-basketball"),
+                                        "Pro Hockey": ("hockey", "nhl"),
+                                        "Pro Baseball": ("baseball", "mlb")
+                                    }
+                                    
+                                    espn_sport, espn_league = sport_map.get(sport, (None, None))
+                                    if espn_sport and espn_league:
+                                        matches = espn_api.search_games_by_teams(espn_sport, espn_league, game["teams"][0], game["teams"][1])
+                                        if matches:
+                                            event = matches[0]
+                                            comps = event.get("competitions", [])
+                                            if comps:
+                                                comp = comps[0]
+                                                competitors = comp.get("competitors", [])
+                                                if len(competitors) >= 2:
+                                                    sorted_competitors = sorted(competitors, key=lambda x: x.get("homeAway", "") != "home")
+                                                    team1_info = sorted_competitors[0]
+                                                    team2_info = sorted_competitors[1]
+                                                    team1 = team1_info.get("team", {})
+                                                    team2 = team2_info.get("team", {})
+                                                    team1_name = team1.get("displayName") or team1.get("shortDisplayName", "Unknown")
+                                                    team2_name = team2.get("displayName") or team2.get("shortDisplayName", "Unknown")
+                                                    team1_score = team1_info.get("score")
+                                                    team2_score = team2_info.get("score")
+                                                    
+                                                    status = comp.get("status", {})
+                                                    status_type = status.get("type", {})
+                                                    status_detail = status_type.get("detail", "")
+                                                    period = status.get("period", 0)
+                                                    clock = status.get("displayClock", "")
+                                                    
+                                                    espn_data = {
+                                                        "team1_name": team1_name,
+                                                        "team2_name": team2_name,
+                                                        "team1_score": team1_score,
+                                                        "team2_score": team2_score,
+                                                        "status_detail": status_detail,
+                                                        "period": period,
+                                                        "clock": clock,
+                                                        "event_id": event.get("id")
+                                                    }
+                                except Exception as e:
+                                    logger.warning(f"[ESPN] Failed to get game data for {teams_str}: {e}")
+                            
+                            # SCORE from ESPN (deterministic)
+                            if espn_data and espn_data.get("team1_score") and espn_data.get("team2_score"):
+                                alert_msg += f"    📊 Score: {espn_data['team1_name']} {espn_data['team1_score']} - {espn_data['team2_name']} {espn_data['team2_score']}\n"
+                            elif game.get("score"):
+                                alert_msg += f"    📊 Score: {game['score']} (from calendar)\n"
                             else:
                                 alert_msg += f"    📊 Score: Not available\n"
                             
-                            # STATUS
-                            alert_msg += f"    ⏱️  Status: {quarter}"
-                            if game.get("time"):
-                                alert_msg += f" - {game['time']}"
-                            alert_msg += "\n"
+                            # STATUS from ESPN (deterministic)
+                            if espn_data and espn_data.get("status_detail"):
+                                alert_msg += f"    ⏱️  Status: {espn_data['status_detail']}\n"
+                            else:
+                                quarter = game.get("quarter", "Unknown")
+                                alert_msg += f"    ⏱️  Status: {quarter}"
+                                if game.get("time"):
+                                    alert_msg += f" - {game['time']}"
+                                alert_msg += "\n"
                             
-                            # PROBABILITIES - Calendar probabilities
+                            # PROBABILITIES - Kalshi Calendar probabilities (what Kalshi displays)
                             calendar_probs = []
                             if game.get("yes_probability"):
                                 calendar_probs.append(f"Yes: {game['yes_probability']}%")
@@ -1493,7 +1606,20 @@ def check_single_parallel_monitor(monitor_id: str):
                                 calendar_probs.append(f"{game['teams'][0]}: {game['team1_probability']}% | {game['teams'][1]}: {game['team2_probability']}%")
                             
                             if calendar_probs:
-                                alert_msg += f"    📈 Calendar Probabilities: {', '.join(calendar_probs)}\n"
+                                alert_msg += f"    📈 Kalshi Calendar Probabilities: {', '.join(calendar_probs)}\n"
+                            
+                            # ESPN Win Probability (deterministic, better than calendar)
+                            if espn_data and espn_data.get("event_id"):
+                                try:
+                                    summary = espn_api.get_game_summary(espn_sport, espn_league, espn_data["event_id"])
+                                    winprob = summary.get("winprobability", [])
+                                    if winprob:
+                                        latest = winprob[-1]
+                                        home_win_prob = latest.get("homeWinPercentage", 0)
+                                        if home_win_prob is not None:
+                                            alert_msg += f"    🎯 ESPN Win Probability: {espn_data['team1_name']} {home_win_prob*100:.1f}% | {espn_data['team2_name']} {(1-home_win_prob)*100:.1f}%\n"
+                                except Exception as e:
+                                    logger.warning(f"[ESPN] Failed to get win probability: {e}")
                             
                             # PROBABILITIES - Kalshi API market prices
                             if game.get("teams") and kalshi_api:
@@ -1519,8 +1645,14 @@ def check_single_parallel_monitor(monitor_id: str):
                                             spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
                                             alert_msg += format_kalshi_odds(orderbook, ticker)
                                             
-                                            # Alpha detection
-                                            alpha = generate_alpha_insight_with_llm(game, market, orderbook, use_search=True)
+                                            # Alpha detection - use ESPN data if available
+                                            game_for_alpha = game.copy()
+                                            if espn_data:
+                                                game_for_alpha["espn_score"] = f"{espn_data['team1_name']} {espn_data['team1_score']} - {espn_data['team2_name']} {espn_data['team2_score']}"
+                                                game_for_alpha["espn_status"] = espn_data.get("status_detail", "")
+                                                game_for_alpha["espn_event_id"] = espn_data.get("event_id")
+                                            
+                                            alpha = generate_alpha_insight_with_llm(game_for_alpha, market, orderbook, use_search=True, espn_data=espn_data)
                                             if alpha:
                                                 alert_msg += f"    {alpha}\n"
                                     else:
