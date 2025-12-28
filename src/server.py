@@ -2440,10 +2440,6 @@ def get_kalshi_market_analysis(ticker: str) -> str:
         return f"Error getting market analysis: {str(e)}"
 
 
-# REMOVED: get_kalshi_insights - This tool is redundant.
-# Use get_kalshi_market_analysis() instead, which includes AI insights plus comprehensive market data and ESPN data.
-
-
 @mcp.tool(description="Watch a Kalshi market for price alerts")
 def watch_kalshi_market(ticker: str, alert_price: int, direction: str = "above", remove_after_trigger: bool = False) -> str:
     """Set up a price alert for a market. Direction: 'above' or 'below'."""
