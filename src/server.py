@@ -634,6 +634,37 @@ def save_parallel_monitors():
         pass
 
 
+def format_kalshi_odds_from_market(market: Dict[str, Any], ticker: str) -> str:
+    """Format Kalshi market data into readable odds/probabilities using bid/ask fields from market object.
+    
+    The Get Markets endpoint returns yes_bid, yes_ask, no_bid, no_ask directly in the market object.
+    """
+    yes_bid = market.get("yes_bid")
+    yes_ask = market.get("yes_ask")
+    no_bid = market.get("no_bid")
+    no_ask = market.get("no_ask")
+    
+    if yes_bid is None or yes_ask is None:
+        return f"    💰 Kalshi Market: No active pricing (ticker: {ticker}) - Market may not have liquidity yet\n"
+    
+    yes_mid = (yes_bid + yes_ask) / 2
+    yes_spread = yes_ask - yes_bid
+    
+    result = f"    💰 Kalshi Live Odds (ticker: {ticker}):\n"
+    result += f"      ✅ YES: {yes_mid:.1f}% (bid: {yes_bid}¢, ask: {yes_ask}¢, spread: {yes_spread:.1f}¢)\n"
+    
+    if no_bid is not None and no_ask is not None:
+        no_mid = (no_bid + no_ask) / 2
+        no_spread = no_ask - no_bid
+        result += f"      ❌ NO: {no_mid:.1f}% (bid: {no_bid}¢, ask: {no_ask}¢, spread: {no_spread:.1f}¢)\n"
+    else:
+        # Calculate No from Yes (should be ~100 - Yes)
+        no_prob = 100 - yes_mid
+        result += f"      ❌ NO: ~{no_prob:.1f}% (derived from Yes price)\n"
+    
+    return result
+
+
 def format_kalshi_odds(orderbook: Dict[str, Any], ticker: str) -> str:
     """Format Kalshi orderbook data into readable odds/probabilities with bid/ask prices and volumes.
     
@@ -1711,12 +1742,74 @@ def get_kalshi_market(ticker: str) -> str:
     
     try:
         market_data = kalshi_api.get_market(ticker)
-        orderbook = kalshi_api.get_orderbook(ticker)
         
-        yes_bids = orderbook.get("yes_bids", [])
-        yes_asks = orderbook.get("yes_asks", [])
-        no_bids = orderbook.get("no_bids", [])
-        no_asks = orderbook.get("no_asks", [])
+        # Get Markets endpoint provides yes_bid, yes_ask, no_bid, no_ask directly
+        yes_bid = market_data.get("yes_bid")
+        yes_ask = market_data.get("yes_ask")
+        no_bid = market_data.get("no_bid")
+        no_ask = market_data.get("no_ask")
+        
+        # Get orderbook for detailed analysis
+        orderbook = None
+        try:
+            orderbook = kalshi_api.get_orderbook(ticker)
+        except Exception as e:
+            logger.warning(f"[KALSHI] Failed to get orderbook for {ticker}: {e}")
+        
+        # Use market data bid/ask if available, otherwise try orderbook
+        if yes_bid is not None and yes_ask is not None:
+            yes_bids = [{"price": yes_bid, "size": 0}]
+            yes_asks = [{"price": yes_ask, "size": 0}]
+        else:
+            # Fallback to orderbook parsing
+            if orderbook:
+                yes_bids_raw = orderbook.get("yes", [])
+                yes_bids = []
+                if yes_bids_raw:
+                    for order in yes_bids_raw:
+                        if isinstance(order, list) and len(order) >= 1:
+                            try:
+                                price = int(order[0]) if len(order) > 0 else 0
+                                size = int(order[1]) if len(order) > 1 else 0
+                                if 0 < price <= 100:
+                                    yes_bids.append({"price": price, "size": size})
+                            except (ValueError, TypeError):
+                                continue
+                    yes_bids.sort(key=lambda x: x["price"])
+                yes_asks = []
+                if yes_bids:
+                    best_yes_bid = yes_bids[-1]["price"]
+                    yes_asks = [{"price": 100 - best_yes_bid, "size": 0}]
+            else:
+                yes_bids = []
+                yes_asks = []
+        
+        if no_bid is not None and no_ask is not None:
+            no_bids = [{"price": no_bid, "size": 0}]
+            no_asks = [{"price": no_ask, "size": 0}]
+        else:
+            # Fallback to orderbook parsing
+            if orderbook:
+                no_bids_raw = orderbook.get("no", [])
+                no_bids = []
+                if no_bids_raw:
+                    for order in no_bids_raw:
+                        if isinstance(order, list) and len(order) >= 1:
+                            try:
+                                price = int(order[0]) if len(order) > 0 else 0
+                                size = int(order[1]) if len(order) > 1 else 0
+                                if 0 < price <= 100:
+                                    no_bids.append({"price": price, "size": size})
+                            except (ValueError, TypeError):
+                                continue
+                    no_bids.sort(key=lambda x: x["price"])
+                no_asks = []
+                if no_bids:
+                    best_no_bid = no_bids[-1]["price"]
+                    no_asks = [{"price": 100 - best_no_bid, "size": 0}]
+            else:
+                no_bids = []
+                no_asks = []
         
         mid_price = None
         bid_price = None
