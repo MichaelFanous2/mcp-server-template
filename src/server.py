@@ -2440,36 +2440,8 @@ def get_kalshi_market_analysis(ticker: str) -> str:
         return f"Error getting market analysis: {str(e)}"
 
 
-@mcp.tool(description="Get AI-generated betting insights for a Kalshi market")
-def get_kalshi_insights(ticker: str) -> str:
-    """Get AI-generated betting insights for a market."""
-    logger.info(f"[MCP TOOL] get_kalshi_insights called - ticker: '{ticker}'")
-    if not kalshi_api:
-        return "Error: Kalshi API not configured."
-    
-    try:
-        market_data = kalshi_api.get_market(ticker)
-        orderbook = kalshi_api.get_orderbook(ticker)
-        
-        # Try to get ESPN data for sports markets
-        espn_data = None
-        try:
-            title_lower = market_data.get('title', '').lower()
-            # Simple heuristic to detect sports markets
-            if any(sport in title_lower for sport in ['nfl', 'nba', 'nhl', 'mlb', 'college']):
-                # Try to get ESPN data (simplified - just check if it's a live game)
-                # For now, skip ESPN lookup in insights to keep it fast
-                pass
-        except:
-            pass
-        
-        insights = generate_market_insights(ticker, market_data, orderbook, espn_data)
-        if not insights:
-            return f"Could not generate insights for {ticker}. Market data retrieved successfully."
-        
-        return f"AI Insights for {ticker} ({market_data.get('title', 'N/A')}):\n\n{insights}"
-    except Exception as e:
-        return f"Error getting insights: {str(e)}"
+# REMOVED: get_kalshi_insights - This tool is redundant.
+# Use get_kalshi_market_analysis() instead, which includes AI insights plus comprehensive market data and ESPN data.
 
 
 @mcp.tool(description="Watch a Kalshi market for price alerts")
