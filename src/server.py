@@ -2793,10 +2793,23 @@ def find_interesting_kalshi_markets(limit: int = 5, search_query: str = "") -> s
                 mid_price = (bid_price + ask_price) / 2
                 spread = ask_price - bid_price
                 
+                # Get market metrics for filtering
+                liquidity = market.get('liquidity')
+                open_interest = market.get('open_interest')
+                volume_24h = market.get('volume_24h')
+                
                 if mid_price < 5 or mid_price > 95:
                     continue
                 
                 if spread > 20:
+                    continue
+                
+                # Filter by liquidity if available (prefer markets with good liquidity)
+                if liquidity is not None and liquidity < 10000:
+                    continue
+                
+                # Filter by open interest if available (prefer markets with activity)
+                if open_interest is not None and open_interest < 100:
                     continue
                 
                 interesting_markets.append({
