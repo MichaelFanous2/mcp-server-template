@@ -1700,6 +1700,74 @@ def start_agent_call(to: str, topic: str) -> str:
     return f"Call started ({call.sid})"
 
 
+@mcp.tool(description="Get a comprehensive list of all Kalshi betting and market analysis capabilities")
+def get_kalshi_capabilities() -> str:
+    """List all available Kalshi betting and market analysis features and tools."""
+    logger.info(f"[MCP TOOL] get_kalshi_capabilities called")
+    
+    capabilities = """
+🎰 **Kalshi Betting & Market Analysis Capabilities**
+
+I can help you with the following Kalshi prediction market features:
+
+## 🔍 **Market Discovery & Search**
+1. **Search Markets** - Search for markets by keyword (e.g., "NFL", "election", "sports")
+2. **Find Interesting Markets** - Discover active, liquid markets with AI-generated insights
+3. **Get Market Details** - Get comprehensive data for any market ticker including:
+   - Current bid/ask prices and spreads
+   - Volume and liquidity metrics
+   - Price movement trends and momentum
+   - Orderbook depth analysis
+
+## 📊 **Market Analysis & Insights**
+4. **AI Betting Insights** - Get AI-generated alpha and betting recommendations for any market
+5. **Market Comparison** - Compare 2-5 markets side-by-side with:
+   - Value analysis
+   - Risk assessments
+   - Liquidity comparisons
+   - AI recommendations on which markets offer best value
+6. **Risk Analysis** - Deep dive into market risk including:
+   - Volume distribution (buyer/seller ratios)
+   - Concentration risk (if one person holds too much volume)
+   - Volume shifts over time
+   - Volatility and liquidity scores
+
+## 🚨 **Monitoring & Alerts**
+7. **Price Alerts** - Set up watches for markets and get alerts when prices hit your targets
+8. **Trade Surge Detection** - Find markets experiencing sudden spikes in trading activity
+9. **Live Game Monitoring** - Monitor Kalshi calendar for live sports games with:
+   - Real-time scores
+   - Current probabilities
+   - Upcoming games
+   - AI-generated alpha insights comparing Kalshi odds vs. market expectations
+
+## 📈 **Real-Time Data**
+10. **Live Odds** - Get current bid/ask prices, spreads, and probabilities for any market
+11. **Recent Insights** - View your recent alerts, insights, and market discoveries
+12. **Trade Surge Alerts** - See which markets had recent trading surges
+
+## 💡 **Smart Features**
+- **AI-Powered Alpha** - Uses LLM reasoning to identify betting opportunities
+- **Risk Scoring** - Comprehensive risk analysis
+- **Web Search Integration** - Can pull in external context for better insights
+- **Automatic Monitoring** - Set up scheduled checks for live games or price alerts
+
+## 🎯 **Example Requests I Can Handle**
+- "Tell me about the live games right now"
+- "What are the best betting opportunities on Kalshi?"
+- "Show me markets with tight spreads and good liquidity"
+- "Compare these three markets: TICKER1, TICKER2, TICKER3"
+- "What's the risk analysis for TICKER?"
+- "Set up a price alert for TICKER when it hits 60 cents"
+- "Find markets with trade surges in the last 5 minutes"
+- "What can you help me with in terms of gambling?"
+
+Just ask me what you'd like to do, and I'll use the right tools to help you!
+"""
+    
+    return capabilities.strip()
+
+
 @mcp.tool(description="Search Kalshi markets by keyword")
 def search_kalshi_markets(query: str, limit: int = 20) -> str:
     """Search for Kalshi markets matching a query."""
