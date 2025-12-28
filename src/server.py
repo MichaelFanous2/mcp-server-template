@@ -2644,6 +2644,82 @@ def get_espn_scores(sport: str, league: str, dates: Optional[str] = None, week: 
             if notes:
                 result += f"  Notes: {len(notes)} note(s) available\n"
             
+            # Try to get betting data and win probability from game summary
+            event_id = event.get("id")
+            if event_id:
+                try:
+                    summary = espn_api.get_game_summary(sport, league, event_id)
+                    
+                    # WIN PROBABILITY - This is the alpha!
+                    winprob = summary.get("winprobability", [])
+                    if winprob:
+                        latest = winprob[-1]
+                        home_win_prob = latest.get("homeWinPercentage", 0)
+                        if home_win_prob is not None:
+                            result += f"\n🎯 WIN PROBABILITY:\n"
+                            result += f"  {team1_name}: {home_win_prob*100:.1f}%\n"
+                            result += f"  {team2_name}: {(1-home_win_prob)*100:.1f}%\n"
+                    
+                    # BETTING LINES (Pickcenter)
+                    pickcenter = summary.get("pickcenter", [])
+                    if pickcenter:
+                        pick = pickcenter[0]  # Usually DraftKings or primary provider
+                        provider = pick.get("provider", {})
+                        provider_name = provider.get("name", "Sportsbook")
+                        
+                        result += f"\n💰 BETTING LINES ({provider_name}):\n"
+                        
+                        # Spread
+                        spread = pick.get("spread")
+                        details = pick.get("details", "")
+                        if spread or details:
+                            result += f"  Spread: {details or f'{spread}'}\n"
+                        
+                        # Over/Under
+                        over_under = pick.get("overUnder")
+                        if over_under:
+                            over_odds = pick.get("overOdds")
+                            under_odds = pick.get("underOdds")
+                            result += f"  Over/Under: {over_under}"
+                            if over_odds:
+                                result += f" (Over: {over_odds}, Under: {under_odds})"
+                            result += "\n"
+                        
+                        # Moneyline
+                        away_odds = pick.get("awayTeamOdds", {})
+                        home_odds = pick.get("homeTeamOdds", {})
+                        away_ml = away_odds.get("moneyLine")
+                        home_ml = home_odds.get("moneyLine")
+                        if away_ml or home_ml:
+                            result += f"  Moneyline: {team2_name} {away_ml or 'N/A'} | {team1_name} {home_ml or 'N/A'}\n"
+                    
+                    # Against The Spread Records
+                    ats = summary.get("againstTheSpread", [])
+                    if ats and isinstance(ats, list):
+                        result += f"\n📊 AGAINST THE SPREAD:\n"
+                        for ats_entry in ats[:2]:  # Show first 2 entries
+                            team_ref = ats_entry.get("team", {})
+                            if isinstance(team_ref, dict):
+                                team_id = team_ref.get("$ref", "").split("/")[-1] if "$ref" in team_ref else ""
+                            else:
+                                team_id = str(team_ref)
+                            
+                            # Match team ID to team name
+                            ats_team_name = team1_name if str(team1_info.get("team", {}).get("id")) == team_id else team2_name
+                            if ats_team_name == team1_name:
+                                ats_team_name = team1_name
+                            else:
+                                ats_team_name = team2_name
+                            
+                            record = ats_entry.get("record", {})
+                            if record:
+                                wins = record.get("wins", 0)
+                                losses = record.get("losses", 0)
+                                ties = record.get("ties", 0)
+                                result += f"  {ats_team_name}: {wins}-{losses}-{ties} ATS\n"
+                except Exception as e:
+                    logger.warning(f"Could not fetch betting data from game summary: {e}")
+            
             result += "\n"
         
         return result
@@ -2799,13 +2875,71 @@ def get_espn_game_score(sport: str, league: str, team1: str, team2: str, dates: 
                             if text:
                                 result += f"  [{period_display} {clock_display}] {text}\n"
                     
-                    # Win probability (if available)
+                    # WIN PROBABILITY - This is the alpha!
                     winprob = summary.get("winprobability", [])
                     if winprob:
                         latest = winprob[-1]
                         home_win_prob = latest.get("homeWinPercentage", 0)
-                        if home_win_prob:
-                            result += f"\nWin Probability: {team1_name} {home_win_prob:.1f}% | {team2_name} {100-home_win_prob:.1f}%\n"
+                        if home_win_prob is not None:
+                            result += f"\n🎯 WIN PROBABILITY:\n"
+                            result += f"  {team1_name}: {home_win_prob*100:.1f}%\n"
+                            result += f"  {team2_name}: {(1-home_win_prob)*100:.1f}%\n"
+                    
+                    # BETTING LINES (Pickcenter)
+                    pickcenter = summary.get("pickcenter", [])
+                    if pickcenter:
+                        pick = pickcenter[0]  # Usually DraftKings or primary provider
+                        provider = pick.get("provider", {})
+                        provider_name = provider.get("name", "Sportsbook") if isinstance(provider, dict) else "Sportsbook"
+                        
+                        result += f"\n💰 BETTING LINES ({provider_name}):\n"
+                        
+                        # Spread
+                        spread = pick.get("spread")
+                        details = pick.get("details", "")
+                        if spread or details:
+                            result += f"  Spread: {details or f'{spread}'}\n"
+                        
+                        # Over/Under
+                        over_under = pick.get("overUnder")
+                        if over_under:
+                            over_odds = pick.get("overOdds")
+                            under_odds = pick.get("underOdds")
+                            result += f"  Over/Under: {over_under}"
+                            if over_odds:
+                                result += f" (Over: {over_odds}, Under: {under_odds})"
+                            result += "\n"
+                        
+                        # Moneyline
+                        away_odds = pick.get("awayTeamOdds", {})
+                        home_odds = pick.get("homeTeamOdds", {})
+                        away_ml = away_odds.get("moneyLine") if isinstance(away_odds, dict) else None
+                        home_ml = home_odds.get("moneyLine") if isinstance(home_odds, dict) else None
+                        if away_ml or home_ml:
+                            result += f"  Moneyline: {team2_name} {away_ml or 'N/A'} | {team1_name} {home_ml or 'N/A'}\n"
+                    
+                    # Against The Spread Records
+                    ats = summary.get("againstTheSpread", [])
+                    if ats and isinstance(ats, list):
+                        result += f"\n📊 AGAINST THE SPREAD:\n"
+                        for ats_entry in ats[:2]:  # Show first 2 entries
+                            team_ref = ats_entry.get("team", {})
+                            if isinstance(team_ref, dict):
+                                team_id = team_ref.get("$ref", "").split("/")[-1] if "$ref" in team_ref else ""
+                            else:
+                                team_id = str(team_ref)
+                            
+                            # Match team ID to team name
+                            team1_id = str(team1_info.get("team", {}).get("id"))
+                            team2_id = str(team2_info.get("team", {}).get("id"))
+                            ats_team_name = team1_name if team_id == team1_id else team2_name
+                            
+                            record = ats_entry.get("record", {})
+                            if record:
+                                wins = record.get("wins", 0)
+                                losses = record.get("losses", 0)
+                                ties = record.get("ties", 0)
+                                result += f"  {ats_team_name}: {wins}-{losses}-{ties} ATS\n"
                 except Exception as e:
                     logger.warning(f"Could not fetch game summary for detailed plays: {e}")
         
