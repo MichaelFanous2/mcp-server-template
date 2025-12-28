@@ -1057,12 +1057,24 @@ def detect_trade_surges(min_trades: int = 10, time_window_minutes: int = 5) -> L
                         ticker_counts[ticker] = {
                             "count": 0,
                             "total_volume": 0,
+                            "yes_volume": 0,  # Volume where taker_side = "yes"
+                            "no_volume": 0,   # Volume where taker_side = "no"
                             "recent_trades": [],
                             "market_title": None
                         }
                     
+                    trade_count = trade.get("count", 0)
+                    taker_side = trade.get("taker_side", "").lower()
+                    
                     ticker_counts[ticker]["count"] += 1
-                    ticker_counts[ticker]["total_volume"] += trade.get("count", 0)
+                    ticker_counts[ticker]["total_volume"] += trade_count
+                    
+                    # Track directional flow
+                    if taker_side == "yes":
+                        ticker_counts[ticker]["yes_volume"] += trade_count
+                    elif taker_side == "no":
+                        ticker_counts[ticker]["no_volume"] += trade_count
+                    
                     ticker_counts[ticker]["recent_trades"].append(trade)
                     
                     if not ticker_counts[ticker]["market_title"]:
@@ -1084,11 +1096,22 @@ def detect_trade_surges(min_trades: int = 10, time_window_minutes: int = 5) -> L
                 except:
                     pass
                 
+                # Calculate directional flow
+                yes_vol = data.get("yes_volume", 0)
+                no_vol = data.get("no_volume", 0)
+                total_vol = data["total_volume"]
+                yes_pct = (yes_vol / total_vol * 100) if total_vol > 0 else 0
+                no_pct = (no_vol / total_vol * 100) if total_vol > 0 else 0
+                
                 surges.append({
                     "ticker": ticker,
                     "title": market_title,
                     "trade_count": data["count"],
                     "total_volume": data["total_volume"],
+                    "yes_volume": yes_vol,
+                    "no_volume": no_vol,
+                    "yes_pct": yes_pct,
+                    "no_pct": no_pct,
                     "time_window_minutes": time_window_minutes,
                     "detected_at": now.isoformat(),
                     "recent_trades": data["recent_trades"][:10]  # Keep top 10 for reference
@@ -2282,11 +2305,43 @@ def get_kalshi_market(ticker: str) -> str:
         if market_data.get('subtitle'):
             result += f"Subtitle: {market_data.get('subtitle')}\n"
         
+        # Add new market metrics
+        volume_24h = market_data.get('volume_24h')
+        open_interest = market_data.get('open_interest')
+        liquidity = market_data.get('liquidity')
+        last_price = market_data.get('last_price')
+        previous_price = market_data.get('previous_price')
+        
         result += f"\n📊 Current Pricing:\n"
         result += f"  Mid Price: {mid_price:.2f} cents\n"
         if bid_price and ask_price:
             result += f"  Bid: {bid_price} | Ask: {ask_price}\n"
             result += f"  Spread: {spread:.2f} cents\n"
+        
+        # Price change from previous
+        if last_price is not None and previous_price is not None:
+            price_change = last_price - previous_price
+            price_change_pct = (price_change / previous_price * 100) if previous_price > 0 else 0
+            direction = "📈" if price_change > 0 else "📉" if price_change < 0 else "➡️"
+            result += f"  Last Trade: {last_price}¢ ({direction} {abs(price_change):.1f}¢ / {abs(price_change_pct):.1f}% from {previous_price}¢)\n"
+        elif last_price is not None:
+            result += f"  Last Trade: {last_price}¢\n"
+        
+        # Market depth metrics
+        result += f"\n💧 Market Depth:\n"
+        if liquidity is not None:
+            liquidity_dollars = market_data.get('liquidity_dollars', '')
+            result += f"  Total Liquidity: {liquidity:,} contracts"
+            if liquidity_dollars:
+                result += f" (${float(liquidity_dollars):,.2f})"
+            result += "\n"
+        if open_interest is not None:
+            result += f"  Open Interest: {open_interest:,} contracts\n"
+        if volume_24h is not None:
+            result += f"  24h Volume: {volume_24h:,} contracts\n"
+        volume_total = market_data.get('volume')
+        if volume_total is not None:
+            result += f"  Total Volume: {volume_total:,} contracts\n"
         
         result += f"\n📈 Orderbook Depth:\n"
         result += f"  Yes Bids: {len(yes_bids)} orders | Yes Asks: {len(yes_asks)} orders\n"
@@ -2415,7 +2470,39 @@ def get_kalshi_market_analysis(ticker: str) -> str:
         result = f"📊 REAL-TIME MARKET ANALYSIS: {ticker}\n"
         result += f"{'='*80}\n\n"
         result += f"Market: {title}\n"
-        result += f"Status: {market_data.get('status', 'N/A')}\n\n"
+        result += f"Status: {market_data.get('status', 'N/A')}\n"
+        
+        # Add market depth metrics
+        volume_24h = market_data.get('volume_24h')
+        open_interest = market_data.get('open_interest')
+        liquidity = market_data.get('liquidity')
+        last_price = market_data.get('last_price')
+        previous_price = market_data.get('previous_price')
+        
+        if liquidity is not None or open_interest is not None or volume_24h is not None:
+            result += f"\n💧 Market Depth:\n"
+            if liquidity is not None:
+                liquidity_dollars = market_data.get('liquidity_dollars', '')
+                result += f"  Total Liquidity: {liquidity:,} contracts"
+                if liquidity_dollars:
+                    result += f" (${float(liquidity_dollars):,.2f})"
+                result += "\n"
+            if open_interest is not None:
+                result += f"  Open Interest: {open_interest:,} contracts\n"
+            if volume_24h is not None:
+                result += f"  24h Volume: {volume_24h:,} contracts\n"
+        
+        # Price change from previous
+        if last_price is not None and previous_price is not None:
+            price_change = last_price - previous_price
+            price_change_pct = (price_change / previous_price * 100) if previous_price > 0 else 0
+            direction = "📈" if price_change > 0 else "📉" if price_change < 0 else "➡️"
+            result += f"\n📊 Price Change:\n"
+            result += f"  Last Trade: {last_price}¢ ({direction} {abs(price_change):.1f}¢ / {abs(price_change_pct):.1f}% from {previous_price}¢)\n"
+        elif last_price is not None:
+            result += f"\n📊 Last Trade: {last_price}¢\n"
+        
+        result += "\n"
         
         # KALSHI ODDS (Real-time)
         result += f"💰 KALSHI ODDS (Real-time):\n"

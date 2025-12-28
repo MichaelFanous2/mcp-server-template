@@ -14,7 +14,7 @@ import time
 # Load credentials
 KALSHI_API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID")
 KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY")
-KALSHI_API_HOST = os.environ.get("KALSHI_API_HOST", "https://trading-api.kalshi.com/trade-api/v2")
+KALSHI_API_HOST = os.environ.get("KALSHI_API_HOST", "https://api.elections.kalshi.com/trade-api/v2")
 
 if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
     print("Error: KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY must be set")
