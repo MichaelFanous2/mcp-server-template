@@ -378,15 +378,16 @@ def generate_market_insights(ticker: str, market_data: Dict[str, Any], orderbook
     if not KALSHI_INSIGHTS_ENABLED or not OPENAI_API_KEY:
         return ""
     
-    yes_bids = orderbook.get("yes_bids", [])
-    yes_asks = orderbook.get("yes_asks", [])
+    parsed = parse_orderbook(orderbook)
+    yes_bids = parsed["yes_bids"]
+    yes_asks = parsed["yes_asks"]
     mid_price = None
     if yes_bids and yes_asks:
-        mid_price = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+        mid_price = (yes_bids[-1].get("price", 0) + yes_asks[0].get("price", 100)) / 2
     elif yes_bids:
-        mid_price = yes_bids[0].get("price", 0)
+        mid_price = yes_bids[-1].get("price", 0)  # Best bid is last element
     elif yes_asks:
-        mid_price = yes_asks[0].get("price", 100)
+        mid_price = yes_asks[0].get("price", 100)  # Best ask is first element
     
     # Build market info with ESPN data if available
     market_info = f"""
@@ -459,16 +460,17 @@ def check_kalshi_watches():
             orderbook = kalshi_api.get_orderbook(ticker)
             market_data = kalshi_api.get_market(ticker)
             
-            yes_bids = orderbook.get("yes_bids", [])
-            yes_asks = orderbook.get("yes_asks", [])
+            parsed = parse_orderbook(orderbook)
+            yes_bids = parsed["yes_bids"]
+            yes_asks = parsed["yes_asks"]
             
             current_price = None
             if yes_bids and yes_asks:
-                current_price = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+                current_price = (yes_bids[-1].get("price", 0) + yes_asks[0].get("price", 100)) / 2
             elif yes_bids:
-                current_price = yes_bids[0].get("price", 0)
+                current_price = yes_bids[-1].get("price", 0)  # Best bid is last element
             elif yes_asks:
-                current_price = yes_asks[0].get("price", 100)
+                current_price = yes_asks[0].get("price", 100)  # Best ask is first element
             
             alert_price = watch.get("alert_price")
             direction = watch.get("direction", "above")
@@ -550,12 +552,91 @@ def check_kalshi_watches():
             print(f"[KALSHI ERROR] Failed to check {ticker}: {e}")
 
 
+def parse_orderbook(orderbook: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse Kalshi orderbook structure into standardized format.
+    
+    The orderbook has 'yes' and 'no' arrays of [price, size] tuples.
+    This function parses them and calculates asks from opposite side bids.
+    
+    Returns:
+        {
+            "yes_bids": [{"price": int, "size": int}, ...],
+            "yes_asks": [{"price": int, "size": int}, ...],
+            "no_bids": [{"price": int, "size": int}, ...],
+            "no_asks": [{"price": int, "size": int}, ...]
+        }
+    """
+    # Unwrap nested orderbook if needed
+    if isinstance(orderbook, dict) and "orderbook" in orderbook:
+        orderbook = orderbook["orderbook"]
+    
+    if not isinstance(orderbook, dict):
+        return {"yes_bids": [], "yes_asks": [], "no_bids": [], "no_asks": []}
+    
+    yes_bids_raw = orderbook.get("yes", [])
+    no_bids_raw = orderbook.get("no", [])
+    
+    # Parse YES bids: array is sorted ascending, last element is best bid
+    yes_bids = []
+    if yes_bids_raw:
+        for order in yes_bids_raw:
+            if isinstance(order, list) and len(order) >= 1:
+                try:
+                    price = int(order[0]) if len(order) > 0 else 0
+                    size = int(order[1]) if len(order) > 1 else 0
+                    if 0 < price <= 100:
+                        yes_bids.append({"price": price, "size": size})
+                except (ValueError, TypeError):
+                    continue
+        yes_bids.sort(key=lambda x: x["price"])
+    
+    # Parse NO bids: same structure
+    no_bids = []
+    if no_bids_raw:
+        for order in no_bids_raw:
+            if isinstance(order, list) and len(order) >= 1:
+                try:
+                    price = int(order[0]) if len(order) > 0 else 0
+                    size = int(order[1]) if len(order) > 1 else 0
+                    if 0 < price <= 100:
+                        no_bids.append({"price": price, "size": size})
+                except (ValueError, TypeError):
+                    continue
+        no_bids.sort(key=lambda x: x["price"])
+    
+    # Calculate asks from opposite side bids
+    # Best YES ask = 100 - (best NO bid)
+    # Best NO ask = 100 - (best YES bid)
+    yes_asks = []
+    no_asks = []
+    
+    if no_bids:
+        best_no_bid_price = no_bids[-1]["price"]  # Last element = highest bid
+        best_yes_ask_price = 100 - best_no_bid_price
+        best_no_bid_size = no_bids[-1]["size"]
+        yes_asks.append({"price": best_yes_ask_price, "size": best_no_bid_size})
+    
+    if yes_bids:
+        best_yes_bid_price = yes_bids[-1]["price"]  # Last element = highest bid
+        best_no_ask_price = 100 - best_yes_bid_price
+        best_yes_bid_size = yes_bids[-1]["size"]
+        no_asks.append({"price": best_no_ask_price, "size": best_yes_bid_size})
+    
+    return {
+        "yes_bids": yes_bids,
+        "yes_asks": yes_asks,
+        "no_bids": no_bids,
+        "no_asks": no_asks
+    }
+
+
 def analyze_orderbook_volume_distribution(orderbook: Dict[str, Any]) -> Dict[str, Any]:
     """Analyze volume distribution and concentration risk."""
-    yes_bids = orderbook.get("yes_bids", [])
-    yes_asks = orderbook.get("yes_asks", [])
-    no_bids = orderbook.get("no_bids", [])
-    no_asks = orderbook.get("no_asks", [])
+    parsed = parse_orderbook(orderbook)
+    yes_bids = parsed["yes_bids"]
+    yes_asks = parsed["yes_asks"]
+    no_bids = parsed["no_bids"]
+    no_asks = parsed["no_asks"]
     
     total_yes_bid_volume = sum(b.get("size", 0) for b in yes_bids)
     total_yes_ask_volume = sum(a.get("size", 0) for a in yes_asks)
@@ -598,14 +679,15 @@ def analyze_orderbook_volume_distribution(orderbook: Dict[str, Any]) -> Dict[str
 
 def calculate_risk_scores(ticker: str, market_data: Dict[str, Any], orderbook: Dict[str, Any], volume_data: Dict[str, Any]) -> Dict[str, Any]:
     """Calculate comprehensive risk scores."""
-    yes_bids = orderbook.get("yes_bids", [])
-    yes_asks = orderbook.get("yes_asks", [])
+    parsed = parse_orderbook(orderbook)
+    yes_bids = parsed["yes_bids"]
+    yes_asks = parsed["yes_asks"]
     
     if not yes_bids or not yes_asks:
         return {"error": "Insufficient data for risk analysis"}
     
-    bid_price = yes_bids[0].get("price", 0)
-    ask_price = yes_asks[0].get("price", 100)
+    bid_price = yes_bids[-1].get("price", 0) if yes_bids else 0  # Best bid is last element
+    ask_price = yes_asks[0].get("price", 100) if yes_asks else 100  # Best ask is first element
     mid_price = (bid_price + ask_price) / 2
     spread = ask_price - bid_price
     
@@ -1147,13 +1229,14 @@ def generate_alpha_insight_with_llm(game_info: Dict[str, Any], market_data: Dict
     if not KALSHI_INSIGHTS_ENABLED or not OPENAI_API_KEY:
         return ""
     
-    yes_bids = orderbook.get("yes_bids", [])
-    yes_asks = orderbook.get("yes_asks", [])
+    parsed = parse_orderbook(orderbook)
+    yes_bids = parsed["yes_bids"]
+    yes_asks = parsed["yes_asks"]
     
     if not yes_bids or not yes_asks:
         return ""
     
-    market_yes_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+    market_yes_prob = (yes_bids[-1].get("price", 0) + yes_asks[0].get("price", 100)) / 2
     
     # Prefer ESPN win probability over calendar probability (more deterministic)
     game_yes_prob = None
@@ -1407,11 +1490,12 @@ def check_parallel_monitors():
                                             ticker = market.get("ticker")
                                             orderbook = kalshi_api.get_orderbook(ticker)
                                             
-                                            yes_bids = orderbook.get("yes_bids", [])
-                                            yes_asks = orderbook.get("yes_asks", [])
+                                            parsed = parse_orderbook(orderbook)
+                                            yes_bids = parsed["yes_bids"]
+                                            yes_asks = parsed["yes_asks"]
                                             if yes_bids and yes_asks:
-                                                market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
-                                                spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
+                                                market_prob = (yes_bids[-1].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+                                                spread = yes_asks[0].get("price", 100) - yes_bids[-1].get("price", 0)
                                                 alert_msg += format_kalshi_odds(orderbook, ticker)
                                                 
                                                 # Alpha detection
@@ -1467,11 +1551,12 @@ def check_parallel_monitors():
                                             ticker = market.get("ticker")
                                             orderbook = kalshi_api.get_orderbook(ticker)
                                             
-                                            yes_bids = orderbook.get("yes_bids", [])
-                                            yes_asks = orderbook.get("yes_asks", [])
+                                            parsed = parse_orderbook(orderbook)
+                                            yes_bids = parsed["yes_bids"]
+                                            yes_asks = parsed["yes_asks"]
                                             if yes_bids and yes_asks:
-                                                market_prob = (yes_bids[0].get("price", 0) + yes_asks[0].get("price", 100)) / 2
-                                                spread = yes_asks[0].get("price", 100) - yes_bids[0].get("price", 0)
+                                                market_prob = (yes_bids[-1].get("price", 0) + yes_asks[0].get("price", 100)) / 2
+                                                spread = yes_asks[0].get("price", 100) - yes_bids[-1].get("price", 0)
                                                 alert_msg += format_kalshi_odds(orderbook, ticker)
                                         else:
                                             alert_msg += f"    💰 Kalshi Market: No matching market found\n"
@@ -2609,14 +2694,15 @@ def find_interesting_kalshi_markets(limit: int = 5, search_query: str = "") -> s
             
             try:
                 orderbook = kalshi_api.get_orderbook(ticker)
-                yes_bids = orderbook.get("yes_bids", [])
-                yes_asks = orderbook.get("yes_asks", [])
+                parsed = parse_orderbook(orderbook)
+                yes_bids = parsed["yes_bids"]
+                yes_asks = parsed["yes_asks"]
                 
                 if not yes_bids or not yes_asks:
                     continue
                 
-                bid_price = yes_bids[0].get("price", 0)
-                ask_price = yes_asks[0].get("price", 100)
+                bid_price = yes_bids[-1].get("price", 0)  # Best bid is last element
+                ask_price = yes_asks[0].get("price", 100)  # Best ask is first element
                 mid_price = (bid_price + ask_price) / 2
                 spread = ask_price - bid_price
                 
@@ -2689,13 +2775,14 @@ def compare_kalshi_markets(tickers: str) -> str:
                 volume_data = analyze_orderbook_volume_distribution(orderbook)
                 risk_scores = calculate_risk_scores(ticker, market_data, orderbook, volume_data)
                 
-                yes_bids = orderbook.get("yes_bids", [])
-                yes_asks = orderbook.get("yes_asks", [])
+                parsed = parse_orderbook(orderbook)
+                yes_bids = parsed["yes_bids"]
+                yes_asks = parsed["yes_asks"]
                 mid_price = None
                 spread = None
                 if yes_bids and yes_asks:
-                    bid_price = yes_bids[0].get("price", 0)
-                    ask_price = yes_asks[0].get("price", 100)
+                    bid_price = yes_bids[-1].get("price", 0)  # Best bid is last element
+                    ask_price = yes_asks[0].get("price", 100)  # Best ask is first element
                     mid_price = (bid_price + ask_price) / 2
                     spread = ask_price - bid_price
                 
