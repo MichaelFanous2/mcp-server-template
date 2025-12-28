@@ -168,7 +168,15 @@ class KalshiAPI:
         return self._request("GET", "/markets/trades", params=params)
     
     def get_market(self, ticker: str) -> Dict[str, Any]:
-        return self._request("GET", f"/markets/{ticker}")
+        """Get market data for a specific ticker.
+        
+        Returns the market object (unwraps the {"market": {...}} response structure).
+        """
+        result = self._request("GET", f"/markets/{ticker}")
+        # API returns {"market": {...}}, so unwrap it
+        if isinstance(result, dict) and "market" in result:
+            return result["market"]
+        return result
 
 kalshi_api = None
 if KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY:
