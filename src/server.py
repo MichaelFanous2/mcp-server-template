@@ -2334,15 +2334,35 @@ def get_kalshi_market_analysis(ticker: str) -> str:
         
         # KALSHI ODDS (Real-time)
         result += f"💰 KALSHI ODDS (Real-time):\n"
-        result += f"  ✅ YES: {yes_mid:.1f}% (Bid: {yes_bid_price}¢ @ {yes_bid_vol} contracts | Ask: {yes_ask_price}¢ @ {yes_ask_vol} contracts | Spread: {yes_spread:.1f}¢)\n"
+        if yes_bids and yes_asks:
+            result += f"  ✅ YES: {yes_mid:.1f}% (Bid: {yes_bid_price}¢ @ {yes_bid_vol} contracts | Ask: {yes_ask_price}¢ @ {yes_ask_vol} contracts | Spread: {yes_spread:.1f}¢)\n"
+        elif yes_bids:
+            result += f"  ✅ YES: {yes_bid_price}¢ (Bid only, no asks yet) @ {yes_bid_vol} contracts\n"
+        elif yes_asks:
+            result += f"  ✅ YES: {yes_ask_price}¢ (Ask only, no bids yet) @ {yes_ask_vol} contracts\n"
+        else:
+            result += f"  ✅ YES: No orderbook data available\n"
+        
         if no_bids and no_asks:
-            no_bid_price = no_bids[0].get("price", 0)
-            no_ask_price = no_asks[0].get("price", 100)
+            no_bid_price = no_bids[-1]["price"]  # Last element = best bid
+            no_ask_price = no_asks[0]["price"]  # First element = best ask
             no_mid = (no_bid_price + no_ask_price) / 2
-            no_bid_vol = no_bids[0].get("size", 0)
-            no_ask_vol = no_asks[0].get("size", 0)
+            no_bid_vol = no_bids[-1]["size"]
+            no_ask_vol = no_asks[0]["size"]
             no_spread = no_ask_price - no_bid_price
             result += f"  ❌ NO: {no_mid:.1f}% (Bid: {no_bid_price}¢ @ {no_bid_vol} contracts | Ask: {no_ask_price}¢ @ {no_ask_vol} contracts | Spread: {no_spread:.1f}¢)\n"
+        elif no_bids:
+            result += f"  ❌ NO: {no_bids[-1]['price']}¢ (Bid only) @ {no_bids[-1]['size']} contracts\n"
+        elif no_asks:
+            result += f"  ❌ NO: {no_asks[0]['price']}¢ (Ask only) @ {no_asks[0]['size']} contracts\n"
+        
+        # Show volume info if available
+        if yes_bids or yes_asks or no_bids or no_asks:
+            total_yes_vol = sum(b.get("size", 0) for b in yes_bids) + sum(a.get("size", 0) for a in yes_asks)
+            total_no_vol = sum(b.get("size", 0) for b in no_bids) + sum(a.get("size", 0) for a in no_asks)
+            if total_yes_vol > 0 or total_no_vol > 0:
+                result += f"  📊 Total Volume: YES {total_yes_vol} contracts | NO {total_no_vol} contracts\n"
+        
         result += "\n"
         
         # Try to get ESPN data for sports markets
