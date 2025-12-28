@@ -185,6 +185,95 @@ if KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY:
     except Exception as e:
         print(f"Warning: Failed to initialize Kalshi API: {e}")
 
+
+class ESPNAPI:
+    """Client for ESPN's public API (unofficial, undocumented)."""
+    
+    BASE_URL = "https://site.api.espn.com/apis/site/v2/sports"
+    CDN_URL = "https://cdn.espn.com/core"
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        })
+    
+    def get_scoreboard(self, sport: str, league: str, dates: Optional[str] = None, week: Optional[int] = None) -> Dict[str, Any]:
+        """Get scoreboard for a sport/league.
+        
+        Args:
+            sport: e.g., 'football', 'basketball', 'baseball', 'hockey'
+            league: e.g., 'nfl', 'nba', 'mlb', 'nhl', 'college-football'
+            dates: Optional date filter (YYYYMMDD or YYYYMMDD-YYYYMMDD)
+            week: Optional week number
+        """
+        url = f"{self.BASE_URL}/{sport}/{league}/scoreboard"
+        params = {}
+        if dates:
+            params["dates"] = dates
+        if week:
+            params["week"] = week
+        
+        logger.info(f"[API CALL] ESPN API - GET {url}, params: {params}")
+        response = self.session.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        logger.info(f"[API CALL] ESPN API response - GET {url} - Status: {response.status_code}")
+        return result
+    
+    def get_game_summary(self, sport: str, league: str, event_id: str) -> Dict[str, Any]:
+        """Get detailed game summary including score, plays, etc.
+        
+        Args:
+            sport: e.g., 'football', 'basketball'
+            league: e.g., 'nfl', 'nba'
+            event_id: ESPN event ID
+        """
+        url = f"{self.BASE_URL}/{sport}/{league}/summary"
+        params = {"event": event_id}
+        
+        logger.info(f"[API CALL] ESPN API - GET {url}, params: {params}")
+        response = self.session.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        logger.info(f"[API CALL] ESPN API response - GET {url} - Status: {response.status_code}")
+        return result
+    
+    def search_games_by_teams(self, sport: str, league: str, team1: str, team2: str, dates: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search for games matching two team names.
+        
+        Args:
+            sport: e.g., 'football', 'basketball'
+            league: e.g., 'nfl', 'nba', 'nhl'
+            team1: First team name (partial match OK)
+            team2: Second team name (partial match OK)
+            dates: Optional date filter (YYYYMMDD)
+        """
+        scoreboard = self.get_scoreboard(sport, league, dates=dates)
+        events = scoreboard.get("events", [])
+        
+        team1_lower = team1.lower()
+        team2_lower = team2.lower()
+        
+        matches = []
+        for event in events:
+            competitors = event.get("competitions", [{}])[0].get("competitors", [])
+            if len(competitors) >= 2:
+                team_names = [c.get("team", {}).get("displayName", "").lower() for c in competitors]
+                team_abbrevs = [c.get("team", {}).get("abbreviation", "").lower() for c in competitors]
+                
+                # Check if both teams match
+                team1_match = any(team1_lower in name or team1_lower in abbrev for name, abbrev in zip(team_names, team_abbrevs))
+                team2_match = any(team2_lower in name or team2_lower in abbrev for name, abbrev in zip(team_names, team_abbrevs))
+                
+                if team1_match and team2_match:
+                    matches.append(event)
+        
+        return matches
+
+
+espn_api = ESPNAPI()
+
 scheduler = BackgroundScheduler()
 
 logging.basicConfig(
