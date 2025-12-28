@@ -2453,6 +2453,133 @@ def get_kalshi_trade_surges(limit: int = 10) -> str:
     return result
 
 
+@mcp.tool(description="Get live sports scores from ESPN. Use this to check current game scores when analyzing Kalshi markets.")
+def get_espn_scores(sport: str, league: str, dates: Optional[str] = None, week: Optional[int] = None) -> str:
+    """Get live sports scores from ESPN API.
+    
+    Args:
+        sport: Sport name (e.g., 'football', 'basketball', 'baseball', 'hockey')
+        league: League name (e.g., 'nfl', 'nba', 'mlb', 'nhl', 'college-football')
+        dates: Optional date filter in YYYYMMDD format (e.g., '20241227')
+        week: Optional week number (for NFL, etc.)
+    """
+    logger.info(f"[MCP TOOL] get_espn_scores called - sport: '{sport}', league: '{league}', dates: {dates}, week: {week}")
+    
+    try:
+        scoreboard = espn_api.get_scoreboard(sport, league, dates=dates, week=week)
+        events = scoreboard.get("events", [])
+        
+        if not events:
+            return f"No games found for {sport}/{league}" + (f" on {dates}" if dates else "")
+        
+        result = f"🏈 Live Scores - {sport.upper()}/{league.upper()}\n\n"
+        
+        for event in events:
+            competitions = event.get("competitions", [])
+            if not competitions:
+                continue
+            
+            comp = competitions[0]
+            competitors = comp.get("competitors", [])
+            
+            if len(competitors) < 2:
+                continue
+            
+            # Get team info
+            team1 = competitors[0].get("team", {})
+            team2 = competitors[1].get("team", {})
+            
+            team1_name = team1.get("displayName", "Unknown")
+            team2_name = team2.get("displayName", "Unknown")
+            team1_score = competitors[0].get("score", "0")
+            team2_score = competitors[1].get("score", "0")
+            
+            # Get game status
+            status = comp.get("status", {})
+            game_status = status.get("type", {}).get("description", "Scheduled")
+            period = status.get("period", 0)
+            clock = status.get("displayClock", "")
+            
+            result += f"{team1_name} vs {team2_name}\n"
+            result += f"  Score: {team1_name} {team1_score} - {team2_name} {team2_score}\n"
+            result += f"  Status: {game_status}"
+            if period > 0:
+                result += f" (Period {period})"
+            if clock:
+                result += f" - {clock}"
+            result += "\n\n"
+        
+        return result
+    except Exception as e:
+        logger.error(f"[ESPN] Error getting scores: {e}")
+        return f"Error getting scores: {str(e)}"
+
+
+@mcp.tool(description="Search for a specific game by team names and get live score. Use this when you know the teams playing.")
+def get_espn_game_score(sport: str, league: str, team1: str, team2: str, dates: Optional[str] = None) -> str:
+    """Get live score for a specific game by team names.
+    
+    Args:
+        sport: Sport name (e.g., 'football', 'basketball', 'hockey')
+        league: League name (e.g., 'nfl', 'nba', 'nhl')
+        team1: First team name (e.g., 'Lakers', 'Kings', 'Rangers')
+        team2: Second team name (e.g., 'Warriors', 'Mavs', 'Islanders')
+        dates: Optional date filter in YYYYMMDD format (e.g., '20241227')
+    """
+    logger.info(f"[MCP TOOL] get_espn_game_score called - sport: '{sport}', league: '{league}', teams: '{team1}' vs '{team2}', dates: {dates}")
+    
+    try:
+        matches = espn_api.search_games_by_teams(sport, league, team1, team2, dates=dates)
+        
+        if not matches:
+            return f"No game found matching {team1} vs {team2} in {sport}/{league}" + (f" on {dates}" if dates else "")
+        
+        result = f"🏈 Game Score - {team1} vs {team2}\n\n"
+        
+        for event in matches:
+            competitions = event.get("competitions", [])
+            if not competitions:
+                continue
+            
+            comp = competitions[0]
+            competitors = comp.get("competitors", [])
+            
+            if len(competitors) < 2:
+                continue
+            
+            team1_info = competitors[0]
+            team2_info = competitors[1]
+            
+            team1_name = team1_info.get("team", {}).get("displayName", "Unknown")
+            team2_name = team2_info.get("team", {}).get("displayName", "Unknown")
+            team1_score = team1_info.get("score", "0")
+            team2_score = team2_info.get("score", "0")
+            
+            # Get detailed status
+            status = comp.get("status", {})
+            game_status = status.get("type", {}).get("description", "Scheduled")
+            period = status.get("period", 0)
+            clock = status.get("displayClock", "")
+            
+            result += f"{team1_name} {team1_score} - {team2_name} {team2_score}\n"
+            result += f"Status: {game_status}"
+            if period > 0:
+                result += f" (Period {period})"
+            if clock:
+                result += f" - {clock}"
+            result += "\n"
+            
+            # Get winner if game is over
+            if game_status == "STATUS_FINAL":
+                winner = team1_name if int(team1_score) > int(team2_score) else team2_name
+                result += f"Winner: {winner}\n"
+        
+        return result
+    except Exception as e:
+        logger.error(f"[ESPN] Error getting game score: {e}")
+        return f"Error getting game score: {str(e)}"
+
+
 @mcp.tool(description="Create a general Parallel API monitor for any URL(s). Monitor interval is in seconds (e.g., 300 for 5 minutes).")
 def create_parallel_monitor(name: str, urls: str, objective: str, monitor_interval: int, monitor_type: str = "general") -> str:
     """Create a monitor for Parallel API extraction. URLs should be comma-separated. Monitor interval is in seconds."""
