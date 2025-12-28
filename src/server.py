@@ -2487,9 +2487,9 @@ def get_espn_scores(sport: str, league: str, dates: Optional[str] = None, week: 
             if len(competitors) < 2:
                 continue
             
-            # ESPN API structure: competitors have team object and score
-            # Sort by home/away if available
-            sorted_competitors = sorted(competitors, key=lambda x: x.get("homeAway", "") == "home")
+            # ESPN API structure: competitors have team object and score (as string)
+            # Sort by home/away: home team first
+            sorted_competitors = sorted(competitors, key=lambda x: x.get("homeAway", "") != "home")
             
             team1_info = sorted_competitors[0]
             team2_info = sorted_competitors[1]
@@ -2497,33 +2497,45 @@ def get_espn_scores(sport: str, league: str, dates: Optional[str] = None, week: 
             team1 = team1_info.get("team", {})
             team2 = team2_info.get("team", {})
             
-            team1_name = team1.get("displayName") or team1.get("name") or team1.get("shortDisplayName", "Unknown")
-            team2_name = team2.get("displayName") or team2.get("name") or team2.get("shortDisplayName", "Unknown")
+            # Team names: displayName is full name, shortDisplayName is short, name is location
+            team1_name = team1.get("displayName") or team1.get("shortDisplayName") or team1.get("name", "Unknown")
+            team2_name = team2.get("displayName") or team2.get("shortDisplayName") or team2.get("name", "Unknown")
             
-            # Score can be None for scheduled games, or a string/int for live/final
+            # Score is a STRING in ESPN API (e.g., "113"), can be None for scheduled games
             team1_score = team1_info.get("score")
             team2_score = team2_info.get("score")
             
-            # Get game status - ESPN uses status.type.description
+            # Get game status - ESPN uses status.type.description for human-readable status
             status = comp.get("status", {})
             status_type = status.get("type", {})
-            game_status = status_type.get("description") or status_type.get("name") or "Scheduled"
+            game_status = status_type.get("description") or status_type.get("name", "Scheduled")
             period = status.get("period", 0)
-            clock = status.get("displayClock") or status.get("clock", "")
+            clock = status.get("displayClock") or ""
             
             # Format score display
-            score_str = f"{team1_name} {team1_score or '0'} - {team2_name} {team2_score or '0'}"
-            if team1_score is None and team2_score is None:
+            if team1_score and team2_score:
+                score_str = f"{team1_name} {team1_score} - {team2_name} {team2_score}"
+            else:
                 score_str = f"{team1_name} vs {team2_name} (Not Started)"
             
             result += f"{team1_name} vs {team2_name}\n"
             result += f"  Score: {score_str}\n"
             result += f"  Status: {game_status}"
             if period > 0:
-                period_name = status.get("periodType", {}).get("name", "Period")
-                result += f" ({period_name} {period})"
+                # Get period detail from status.type.detail if available
+                period_detail = status_type.get("detail", "")
+                if period_detail:
+                    result += f" ({period_detail})"
+                else:
+                    result += f" (Period {period})"
             if clock:
                 result += f" - {clock}"
+            
+            # Show winner if game is final
+            if status_type.get("completed") and team1_info.get("winner") is not None:
+                winner_name = team1_name if team1_info.get("winner") else team2_name
+                result += f"\n  Winner: {winner_name}"
+            
             result += "\n\n"
         
         return result
@@ -2564,49 +2576,51 @@ def get_espn_game_score(sport: str, league: str, team1: str, team2: str, dates: 
             if len(competitors) < 2:
                 continue
             
-            # Sort by home/away if available
-            sorted_competitors = sorted(competitors, key=lambda x: x.get("homeAway", "") == "home")
+            # Sort by home/away: home team first
+            sorted_competitors = sorted(competitors, key=lambda x: x.get("homeAway", "") != "home")
             team1_info = sorted_competitors[0]
             team2_info = sorted_competitors[1]
             
             team1 = team1_info.get("team", {})
             team2 = team2_info.get("team", {})
             
-            team1_name = team1.get("displayName") or team1.get("name") or team1.get("shortDisplayName", "Unknown")
-            team2_name = team2.get("displayName") or team2.get("name") or team2.get("shortDisplayName", "Unknown")
+            # Team names: displayName is full name, shortDisplayName is short
+            team1_name = team1.get("displayName") or team1.get("shortDisplayName") or team1.get("name", "Unknown")
+            team2_name = team2.get("displayName") or team2.get("shortDisplayName") or team2.get("name", "Unknown")
             
-            # Score can be None for scheduled games
+            # Score is a STRING in ESPN API (e.g., "113"), can be None for scheduled games
             team1_score = team1_info.get("score")
             team2_score = team2_info.get("score")
             
-            # Get detailed status - ESPN uses status.type.description
+            # Get detailed status - ESPN uses status.type.description for human-readable status
             status = comp.get("status", {})
             status_type = status.get("type", {})
-            game_status = status_type.get("description") or status_type.get("name") or "Scheduled"
+            game_status = status_type.get("description") or status_type.get("name", "Scheduled")
             period = status.get("period", 0)
-            clock = status.get("displayClock") or status.get("clock", "")
+            clock = status.get("displayClock") or ""
             
             # Format score
-            if team1_score is not None and team2_score is not None:
+            if team1_score and team2_score:
                 result += f"{team1_name} {team1_score} - {team2_name} {team2_score}\n"
             else:
                 result += f"{team1_name} vs {team2_name} (Not Started)\n"
             
             result += f"Status: {game_status}"
             if period > 0:
-                period_name = status.get("periodType", {}).get("name", "Period")
-                result += f" ({period_name} {period})"
+                # Get period detail from status.type.detail if available
+                period_detail = status_type.get("detail", "")
+                if period_detail:
+                    result += f" ({period_detail})"
+                else:
+                    result += f" (Period {period})"
             if clock:
                 result += f" - {clock}"
             result += "\n"
             
-            # Get winner if game is over
-            if game_status in ["STATUS_FINAL", "STATUS_FINAL"] and team1_score is not None and team2_score is not None:
-                try:
-                    winner = team1_name if int(team1_score) > int(team2_score) else team2_name
-                    result += f"Winner: {winner}\n"
-                except (ValueError, TypeError):
-                    pass
+            # Get winner if game is over - ESPN has winner boolean on competitor
+            if status_type.get("completed") and team1_info.get("winner") is not None:
+                winner_name = team1_name if team1_info.get("winner") else team2_name
+                result += f"Winner: {winner_name}\n"
         
         return result
     except Exception as e:
