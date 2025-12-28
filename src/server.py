@@ -2488,7 +2488,7 @@ def get_espn_scores(sport: str, league: str, dates: Optional[str] = None, week: 
                 continue
             
             # ESPN API structure: competitors have team object and score (as string)
-            # Sort by home/away: home team first
+            # Sort by home/away: home team first (homeAway="home" comes first)
             sorted_competitors = sorted(competitors, key=lambda x: x.get("homeAway", "") != "home")
             
             team1_info = sorted_competitors[0]
@@ -2501,7 +2501,7 @@ def get_espn_scores(sport: str, league: str, dates: Optional[str] = None, week: 
             team1_name = team1.get("displayName") or team1.get("shortDisplayName") or team1.get("name", "Unknown")
             team2_name = team2.get("displayName") or team2.get("shortDisplayName") or team2.get("name", "Unknown")
             
-            # Score is a STRING in ESPN API (e.g., "113"), can be None for scheduled games
+            # Score is a STRING in ESPN API (e.g., "113"), can be None/empty for scheduled games
             team1_score = team1_info.get("score")
             team2_score = team2_info.get("score")
             
@@ -2511,32 +2511,50 @@ def get_espn_scores(sport: str, league: str, dates: Optional[str] = None, week: 
             game_status = status_type.get("description") or status_type.get("name", "Scheduled")
             period = status.get("period", 0)
             clock = status.get("displayClock") or ""
+            completed = status_type.get("completed", False)
             
             # Format score display
-            if team1_score and team2_score:
-                score_str = f"{team1_name} {team1_score} - {team2_name} {team2_score}"
+            # Scores can be None, empty string, or actual score string
+            has_scores = team1_score and team2_score and team1_score != "0" and team2_score != "0"
+            if has_scores or (team1_score and team2_score):  # Show scores even if 0-0 for live games
+                score_str = f"{team1_name} {team1_score or '0'} - {team2_name} {team2_score or '0'}"
             else:
-                score_str = f"{team1_name} vs {team2_name} (Not Started)"
+                score_str = f"{team1_name} vs {team2_name}"
             
             result += f"{team1_name} vs {team2_name}\n"
             result += f"  Score: {score_str}\n"
-            result += f"  Status: {game_status}"
-            if period > 0:
-                # Get period detail from status.type.detail if available
-                period_detail = status_type.get("detail", "")
-                if period_detail:
-                    result += f" ({period_detail})"
-                else:
+            
+            # Status display - use detail field which has better formatting
+            status_detail = status_type.get("detail", "")
+            if status_detail and status_detail != game_status:
+                # Detail field has better info like "6:35 - 1st Quarter" or "Sat, December 27th at 8:00 PM EST"
+                result += f"  Status: {status_detail}\n"
+            else:
+                result += f"  Status: {game_status}"
+                if period > 0:
                     result += f" (Period {period})"
-            if clock:
-                result += f" - {clock}"
+                if clock and clock != "0.0":
+                    result += f" - {clock}"
+                result += "\n"
             
-            # Show winner if game is final
-            if status_type.get("completed") and team1_info.get("winner") is not None:
-                winner_name = team1_name if team1_info.get("winner") else team2_name
-                result += f"\n  Winner: {winner_name}"
+            # Show winner if game is final (winner field only present when completed)
+            if completed:
+                # Winner field is boolean on competitor object, only present when game is final
+                if team1_info.get("winner") is True:
+                    result += f"  Winner: {team1_name}\n"
+                elif team2_info.get("winner") is True:
+                    result += f"  Winner: {team2_name}\n"
+                # Fallback: determine winner by score if winner field not present
+                elif team1_score and team2_score:
+                    try:
+                        if int(team1_score) > int(team2_score):
+                            result += f"  Winner: {team1_name}\n"
+                        elif int(team2_score) > int(team1_score):
+                            result += f"  Winner: {team2_name}\n"
+                    except (ValueError, TypeError):
+                        pass
             
-            result += "\n\n"
+            result += "\n"
         
         return result
     except Exception as e:
@@ -2588,7 +2606,7 @@ def get_espn_game_score(sport: str, league: str, team1: str, team2: str, dates: 
             team1_name = team1.get("displayName") or team1.get("shortDisplayName") or team1.get("name", "Unknown")
             team2_name = team2.get("displayName") or team2.get("shortDisplayName") or team2.get("name", "Unknown")
             
-            # Score is a STRING in ESPN API (e.g., "113"), can be None for scheduled games
+            # Score is a STRING in ESPN API (e.g., "113"), can be None/empty for scheduled games
             team1_score = team1_info.get("score")
             team2_score = team2_info.get("score")
             
@@ -2598,29 +2616,42 @@ def get_espn_game_score(sport: str, league: str, team1: str, team2: str, dates: 
             game_status = status_type.get("description") or status_type.get("name", "Scheduled")
             period = status.get("period", 0)
             clock = status.get("displayClock") or ""
+            completed = status_type.get("completed", False)
+            status_detail = status_type.get("detail", "")
             
             # Format score
-            if team1_score and team2_score:
-                result += f"{team1_name} {team1_score} - {team2_name} {team2_score}\n"
+            has_scores = team1_score and team2_score and team1_score != "0" and team2_score != "0"
+            if has_scores or (team1_score and team2_score):
+                result += f"{team1_name} {team1_score or '0'} - {team2_name} {team2_score or '0'}\n"
             else:
                 result += f"{team1_name} vs {team2_name} (Not Started)\n"
             
-            result += f"Status: {game_status}"
-            if period > 0:
-                # Get period detail from status.type.detail if available
-                period_detail = status_type.get("detail", "")
-                if period_detail:
-                    result += f" ({period_detail})"
-                else:
+            # Use detail field which has better formatting (e.g., "6:35 - 1st Quarter" or "Sat, December 27th at 8:00 PM EST")
+            if status_detail and status_detail != game_status:
+                result += f"Status: {status_detail}\n"
+            else:
+                result += f"Status: {game_status}"
+                if period > 0:
                     result += f" (Period {period})"
-            if clock:
-                result += f" - {clock}"
-            result += "\n"
+                if clock and clock != "0.0":
+                    result += f" - {clock}"
+                result += "\n"
             
-            # Get winner if game is over - ESPN has winner boolean on competitor
-            if status_type.get("completed") and team1_info.get("winner") is not None:
-                winner_name = team1_name if team1_info.get("winner") else team2_name
-                result += f"Winner: {winner_name}\n"
+            # Get winner if game is over - winner field only present when completed
+            if completed:
+                if team1_info.get("winner") is True:
+                    result += f"Winner: {team1_name}\n"
+                elif team2_info.get("winner") is True:
+                    result += f"Winner: {team2_name}\n"
+                # Fallback: determine by score
+                elif team1_score and team2_score:
+                    try:
+                        if int(team1_score) > int(team2_score):
+                            result += f"Winner: {team1_name}\n"
+                        elif int(team2_score) > int(team1_score):
+                            result += f"Winner: {team2_name}\n"
+                    except (ValueError, TypeError):
+                        pass
         
         return result
     except Exception as e:
