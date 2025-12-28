@@ -3008,6 +3008,14 @@ def detect_kalshi_trade_surges(min_trades: int = 10, time_window_minutes: int = 
         for i, surge in enumerate(surges[:20], 1):  # Show top 20
             result += f"{i}. {surge['ticker']}: {surge['title']}\n"
             result += f"   📊 {surge['trade_count']} trades | {surge['total_volume']} contracts\n"
+            
+            # Show directional flow if available
+            if surge.get('yes_volume') is not None and surge.get('no_volume') is not None:
+                yes_pct = surge.get('yes_pct', 0)
+                no_pct = surge.get('no_pct', 0)
+                flow_direction = "🟢 YES" if yes_pct > 60 else "🔴 NO" if no_pct > 60 else "🟡 MIXED"
+                result += f"   💹 Flow: {flow_direction} ({yes_pct:.1f}% YES, {no_pct:.1f}% NO)\n"
+            
             result += f"   ⏰ Detected: {surge['detected_at']}\n"
             
             # Get current market price if available
