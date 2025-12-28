@@ -373,7 +373,8 @@ def save_kalshi_watches():
         pass
 
 
-def generate_market_insights(ticker: str, market_data: Dict[str, Any], orderbook: Dict[str, Any]) -> str:
+def generate_market_insights(ticker: str, market_data: Dict[str, Any], orderbook: Dict[str, Any], espn_data: Optional[Dict[str, Any]] = None) -> str:
+    """Generate market insights. For sports markets, uses ESPN data for richer context."""
     if not KALSHI_INSIGHTS_ENABLED or not OPENAI_API_KEY:
         return ""
     
@@ -387,6 +388,7 @@ def generate_market_insights(ticker: str, market_data: Dict[str, Any], orderbook
     elif yes_asks:
         mid_price = yes_asks[0].get("price", 100)
     
+    # Build market info with ESPN data if available
     market_info = f"""
 Market: {market_data.get('title', 'N/A')}
 Ticker: {ticker}
@@ -396,20 +398,42 @@ Yes Bids: {len(yes_bids)}
 Yes Asks: {len(yes_asks)}
 """
     
+    # Add ESPN data for sports markets
+    if espn_data:
+        market_info += f"""
+ESPN Game Data:
+- Score: {espn_data.get('team1_name', 'Team1')} {espn_data.get('team1_score', 'N/A')} - {espn_data.get('team2_name', 'Team2')} {espn_data.get('team2_score', 'N/A')}
+- Status: {espn_data.get('status_detail', 'N/A')}
+- Win Probability: {espn_data.get('team1_name', 'Team1')} {espn_data.get('home_win_prob', 0)*100:.1f}% | {espn_data.get('team2_name', 'Team2')} {(1-espn_data.get('home_win_prob', 0))*100:.1f}%
+"""
+        if espn_data.get('recent_plays'):
+            market_info += f"- Recent Plays: {espn_data['recent_plays']}\n"
+        if espn_data.get('betting_lines'):
+            market_info += f"- Betting Lines: {espn_data['betting_lines']}\n"
+    
+    instructions = (
+        "You are a betting market analyst. Provide a brief, actionable insight (2-3 sentences max) "
+        "on whether this market presents a good betting opportunity. "
+    )
+    
+    if espn_data:
+        instructions += (
+            "Compare the Kalshi market price to ESPN's win probability and current game state. "
+            "Consider if the market is mispricing based on live game data. "
+        )
+    
+    instructions += "Consider price, liquidity, and market dynamics. Be direct and practical."
+    
     payload = {
         "model": "gpt-4.1-mini",
-        "instructions": (
-            "You are a betting market analyst. Provide a brief, actionable insight (2-3 sentences max) "
-            "on whether this market presents a good betting opportunity. Consider price, liquidity, "
-            "and market dynamics. Be direct and practical."
-        ),
+        "instructions": instructions,
         "input": f"Analyze this Kalshi prediction market:\n{market_info}\n\nProvide betting insight:",
         "max_output_tokens": 150,
         "temperature": 0.7,
     }
     
     try:
-        logger.info(f"[API CALL] OpenAI generate_market_insights - ticker: '{ticker}', mid_price: {mid_price}")
+        logger.info(f"[API CALL] OpenAI generate_market_insights - ticker: '{ticker}', mid_price: {mid_price}, has_espn: {espn_data is not None}")
         resp = requests.post(
             "https://api.openai.com/v1/responses",
             headers={
@@ -2225,6 +2249,197 @@ def get_kalshi_market(ticker: str) -> str:
         return f"Error getting market: {str(e)}"
 
 
+@mcp.tool(description="Get comprehensive real-time analysis for a Kalshi market with ESPN data (for sports markets). Returns structured data: Kalshi odds, ESPN scores, win probability, game context, and AI insights.")
+def get_kalshi_market_analysis(ticker: str) -> str:
+    """Get comprehensive real-time analysis combining Kalshi market data and ESPN game data (for sports markets).
+    Returns structured output with: Kalshi odds (bid/ask/volumes), ESPN scores, win probability, game context, and AI insights."""
+    logger.info(f"[MCP TOOL] get_kalshi_market_analysis called - ticker: '{ticker}'")
+    if not kalshi_api:
+        return "Error: Kalshi API not configured."
+    
+    try:
+        # Get Kalshi market data
+        market_data = kalshi_api.get_market(ticker)
+        orderbook = kalshi_api.get_orderbook(ticker)
+        
+        title = market_data.get('title', 'N/A')
+        
+        # Parse Kalshi odds
+        yes_bids = orderbook.get("yes_bids", [])
+        yes_asks = orderbook.get("yes_asks", [])
+        no_bids = orderbook.get("no_bids", [])
+        no_asks = orderbook.get("no_asks", [])
+        
+        # Get best bid/ask
+        yes_bid_price = yes_bids[0].get("price", 0) if yes_bids else 0
+        yes_ask_price = yes_asks[0].get("price", 100) if yes_asks else 100
+        yes_bid_vol = yes_bids[0].get("size", 0) if yes_bids else 0
+        yes_ask_vol = yes_asks[0].get("size", 0) if yes_asks else 0
+        yes_mid = (yes_bid_price + yes_ask_price) / 2 if yes_bids and yes_asks else (yes_bid_price or yes_ask_price)
+        yes_spread = yes_ask_price - yes_bid_price if yes_bids and yes_asks else 0
+        
+        # Build structured output
+        result = f"📊 REAL-TIME MARKET ANALYSIS: {ticker}\n"
+        result += f"{'='*80}\n\n"
+        result += f"Market: {title}\n"
+        result += f"Status: {market_data.get('status', 'N/A')}\n\n"
+        
+        # KALSHI ODDS (Real-time)
+        result += f"💰 KALSHI ODDS (Real-time):\n"
+        result += f"  ✅ YES: {yes_mid:.1f}% (Bid: {yes_bid_price}¢ @ {yes_bid_vol} contracts | Ask: {yes_ask_price}¢ @ {yes_ask_vol} contracts | Spread: {yes_spread:.1f}¢)\n"
+        if no_bids and no_asks:
+            no_bid_price = no_bids[0].get("price", 0)
+            no_ask_price = no_asks[0].get("price", 100)
+            no_mid = (no_bid_price + no_ask_price) / 2
+            no_bid_vol = no_bids[0].get("size", 0)
+            no_ask_vol = no_asks[0].get("size", 0)
+            no_spread = no_ask_price - no_bid_price
+            result += f"  ❌ NO: {no_mid:.1f}% (Bid: {no_bid_price}¢ @ {no_bid_vol} contracts | Ask: {no_ask_price}¢ @ {no_ask_vol} contracts | Spread: {no_spread:.1f}¢)\n"
+        result += "\n"
+        
+        # Try to get ESPN data for sports markets
+        espn_data = None
+        try:
+            # Extract teams from market title (heuristic)
+            title_lower = title.lower()
+            sport_map = {
+                "nfl": ("football", "nfl"),
+                "nba": ("basketball", "nba"),
+                "nhl": ("hockey", "nhl"),
+                "mlb": ("baseball", "mlb"),
+                "college football": ("football", "college-football"),
+                "college basketball": ("basketball", "mens-college-basketball")
+            }
+            
+            # Try to detect sport and teams
+            sport_key = None
+            espn_sport = None
+            espn_league = None
+            for key, (sport, league) in sport_map.items():
+                if key in title_lower:
+                    sport_key = key
+                    espn_sport = sport
+                    espn_league = league
+                    break
+            
+            if espn_sport and espn_league:
+                # Try to find matching game
+                scoreboard = espn_api.get_scoreboard(espn_sport, espn_league)
+                events = scoreboard.get("events", [])
+                
+                # Look for events matching teams in title
+                for event in events:
+                    comps = event.get("competitions", [])
+                    if comps:
+                        comp = comps[0]
+                        competitors = comp.get("competitors", [])
+                        if len(competitors) >= 2:
+                            team1 = competitors[0].get("team", {})
+                            team2 = competitors[1].get("team", {})
+                            team1_name = team1.get("displayName", "").lower()
+                            team2_name = team2.get("displayName", "").lower()
+                            team1_abbr = team1.get("abbreviation", "").lower()
+                            team2_abbr = team2.get("abbreviation", "").lower()
+                            
+                            # Check if teams match title
+                            if (team1_name in title_lower or team1_abbr in title_lower or 
+                                team2_name in title_lower or team2_abbr in title_lower):
+                                
+                                sorted_competitors = sorted(competitors, key=lambda x: x.get("homeAway", "") != "home")
+                                team1_info = sorted_competitors[0]
+                                team2_info = sorted_competitors[1]
+                                
+                                team1_obj = team1_info.get("team", {})
+                                team2_obj = team2_info.get("team", {})
+                                team1_display = team1_obj.get("displayName") or team1_obj.get("shortDisplayName", "Unknown")
+                                team2_display = team2_obj.get("displayName") or team2_obj.get("shortDisplayName", "Unknown")
+                                
+                                team1_score = team1_info.get("score")
+                                team2_score = team2_info.get("score")
+                                
+                                status = comp.get("status", {})
+                                status_type = status.get("type", {})
+                                status_detail = status_type.get("detail", "")
+                                period = status.get("period", 0)
+                                clock = status.get("displayClock", "")
+                                
+                                event_id = event.get("id")
+                                
+                                # Get game summary for win probability and plays
+                                summary = espn_api.get_game_summary(espn_sport, espn_league, event_id)
+                                
+                                winprob = summary.get("winprobability", [])
+                                home_win_prob = None
+                                if winprob:
+                                    latest = winprob[-1]
+                                    home_win_prob = latest.get("homeWinPercentage", 0)
+                                
+                                # Get recent plays
+                                plays = summary.get("plays", [])
+                                recent_plays_str = ""
+                                if plays:
+                                    recent_plays = []
+                                    for play in plays[-3:]:
+                                        text = play.get("text", "")
+                                        period_obj = play.get("period", {})
+                                        period_display = period_obj.get("displayValue", "")
+                                        clock_obj = play.get("clock", {})
+                                        clock_display = clock_obj.get("displayValue", "")
+                                        if text:
+                                            recent_plays.append(f"[{period_display} {clock_display}] {text}")
+                                    recent_plays_str = "\n    ".join(recent_plays)
+                                
+                                # Get betting lines
+                                pickcenter = summary.get("pickcenter", [])
+                                betting_lines_str = ""
+                                if pickcenter:
+                                    pick = pickcenter[0]
+                                    details = pick.get("details", "")
+                                    over_under = pick.get("overUnder")
+                                    if details or over_under:
+                                        betting_lines_str = f"{details}" + (f" | O/U: {over_under}" if over_under else "")
+                                
+                                espn_data = {
+                                    "team1_name": team1_display,
+                                    "team2_name": team2_display,
+                                    "team1_score": team1_score,
+                                    "team2_score": team2_score,
+                                    "status_detail": status_detail,
+                                    "period": period,
+                                    "clock": clock,
+                                    "home_win_prob": home_win_prob,
+                                    "recent_plays": recent_plays_str,
+                                    "betting_lines": betting_lines_str
+                                }
+                                break
+        except Exception as e:
+            logger.warning(f"[ESPN] Failed to get ESPN data for {ticker}: {e}")
+        
+        # ESPN DATA (if available)
+        if espn_data:
+            result += f"🏀 ESPN GAME DATA:\n"
+            result += f"  Score: {espn_data['team1_name']} {espn_data['team1_score'] or '0'} - {espn_data['team2_name']} {espn_data['team2_score'] or '0'}\n"
+            result += f"  Status: {espn_data['status_detail']}\n"
+            if espn_data.get('home_win_prob') is not None:
+                result += f"  🎯 Win Probability: {espn_data['team1_name']} {espn_data['home_win_prob']*100:.1f}% | {espn_data['team2_name']} {(1-espn_data['home_win_prob'])*100:.1f}%\n"
+            if espn_data.get('betting_lines'):
+                result += f"  💰 Betting Lines: {espn_data['betting_lines']}\n"
+            if espn_data.get('recent_plays'):
+                result += f"  📝 Recent Plays:\n    {espn_data['recent_plays']}\n"
+            result += "\n"
+        else:
+            result += f"🏀 ESPN GAME DATA: Not available (market may not be sports-related or game not found)\n\n"
+        
+        # AI INSIGHTS
+        insights = generate_market_insights(ticker, market_data, orderbook, espn_data)
+        if insights:
+            result += f"💡 AI INSIGHTS:\n  {insights}\n"
+        
+        return result
+    except Exception as e:
+        return f"Error getting market analysis: {str(e)}"
+
+
 @mcp.tool(description="Get AI-generated betting insights for a Kalshi market")
 def get_kalshi_insights(ticker: str) -> str:
     """Get AI-generated betting insights for a market."""
@@ -2236,7 +2451,19 @@ def get_kalshi_insights(ticker: str) -> str:
         market_data = kalshi_api.get_market(ticker)
         orderbook = kalshi_api.get_orderbook(ticker)
         
-        insights = generate_market_insights(ticker, market_data, orderbook)
+        # Try to get ESPN data for sports markets
+        espn_data = None
+        try:
+            title_lower = market_data.get('title', '').lower()
+            # Simple heuristic to detect sports markets
+            if any(sport in title_lower for sport in ['nfl', 'nba', 'nhl', 'mlb', 'college']):
+                # Try to get ESPN data (simplified - just check if it's a live game)
+                # For now, skip ESPN lookup in insights to keep it fast
+                pass
+        except:
+            pass
+        
+        insights = generate_market_insights(ticker, market_data, orderbook, espn_data)
         if not insights:
             return f"Could not generate insights for {ticker}. Market data retrieved successfully."
         
