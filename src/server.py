@@ -2487,26 +2487,41 @@ def get_espn_scores(sport: str, league: str, dates: Optional[str] = None, week: 
             if len(competitors) < 2:
                 continue
             
-            # Get team info
-            team1 = competitors[0].get("team", {})
-            team2 = competitors[1].get("team", {})
+            # ESPN API structure: competitors have team object and score
+            # Sort by home/away if available
+            sorted_competitors = sorted(competitors, key=lambda x: x.get("homeAway", "") == "home")
             
-            team1_name = team1.get("displayName", "Unknown")
-            team2_name = team2.get("displayName", "Unknown")
-            team1_score = competitors[0].get("score", "0")
-            team2_score = competitors[1].get("score", "0")
+            team1_info = sorted_competitors[0]
+            team2_info = sorted_competitors[1]
             
-            # Get game status
+            team1 = team1_info.get("team", {})
+            team2 = team2_info.get("team", {})
+            
+            team1_name = team1.get("displayName") or team1.get("name") or team1.get("shortDisplayName", "Unknown")
+            team2_name = team2.get("displayName") or team2.get("name") or team2.get("shortDisplayName", "Unknown")
+            
+            # Score can be None for scheduled games, or a string/int for live/final
+            team1_score = team1_info.get("score")
+            team2_score = team2_info.get("score")
+            
+            # Get game status - ESPN uses status.type.description
             status = comp.get("status", {})
-            game_status = status.get("type", {}).get("description", "Scheduled")
+            status_type = status.get("type", {})
+            game_status = status_type.get("description") or status_type.get("name") or "Scheduled"
             period = status.get("period", 0)
-            clock = status.get("displayClock", "")
+            clock = status.get("displayClock") or status.get("clock", "")
+            
+            # Format score display
+            score_str = f"{team1_name} {team1_score or '0'} - {team2_name} {team2_score or '0'}"
+            if team1_score is None and team2_score is None:
+                score_str = f"{team1_name} vs {team2_name} (Not Started)"
             
             result += f"{team1_name} vs {team2_name}\n"
-            result += f"  Score: {team1_name} {team1_score} - {team2_name} {team2_score}\n"
+            result += f"  Score: {score_str}\n"
             result += f"  Status: {game_status}"
             if period > 0:
-                result += f" (Period {period})"
+                period_name = status.get("periodType", {}).get("name", "Period")
+                result += f" ({period_name} {period})"
             if clock:
                 result += f" - {clock}"
             result += "\n\n"
@@ -2549,32 +2564,49 @@ def get_espn_game_score(sport: str, league: str, team1: str, team2: str, dates: 
             if len(competitors) < 2:
                 continue
             
-            team1_info = competitors[0]
-            team2_info = competitors[1]
+            # Sort by home/away if available
+            sorted_competitors = sorted(competitors, key=lambda x: x.get("homeAway", "") == "home")
+            team1_info = sorted_competitors[0]
+            team2_info = sorted_competitors[1]
             
-            team1_name = team1_info.get("team", {}).get("displayName", "Unknown")
-            team2_name = team2_info.get("team", {}).get("displayName", "Unknown")
-            team1_score = team1_info.get("score", "0")
-            team2_score = team2_info.get("score", "0")
+            team1 = team1_info.get("team", {})
+            team2 = team2_info.get("team", {})
             
-            # Get detailed status
+            team1_name = team1.get("displayName") or team1.get("name") or team1.get("shortDisplayName", "Unknown")
+            team2_name = team2.get("displayName") or team2.get("name") or team2.get("shortDisplayName", "Unknown")
+            
+            # Score can be None for scheduled games
+            team1_score = team1_info.get("score")
+            team2_score = team2_info.get("score")
+            
+            # Get detailed status - ESPN uses status.type.description
             status = comp.get("status", {})
-            game_status = status.get("type", {}).get("description", "Scheduled")
+            status_type = status.get("type", {})
+            game_status = status_type.get("description") or status_type.get("name") or "Scheduled"
             period = status.get("period", 0)
-            clock = status.get("displayClock", "")
+            clock = status.get("displayClock") or status.get("clock", "")
             
-            result += f"{team1_name} {team1_score} - {team2_name} {team2_score}\n"
+            # Format score
+            if team1_score is not None and team2_score is not None:
+                result += f"{team1_name} {team1_score} - {team2_name} {team2_score}\n"
+            else:
+                result += f"{team1_name} vs {team2_name} (Not Started)\n"
+            
             result += f"Status: {game_status}"
             if period > 0:
-                result += f" (Period {period})"
+                period_name = status.get("periodType", {}).get("name", "Period")
+                result += f" ({period_name} {period})"
             if clock:
                 result += f" - {clock}"
             result += "\n"
             
             # Get winner if game is over
-            if game_status == "STATUS_FINAL":
-                winner = team1_name if int(team1_score) > int(team2_score) else team2_name
-                result += f"Winner: {winner}\n"
+            if game_status in ["STATUS_FINAL", "STATUS_FINAL"] and team1_score is not None and team2_score is not None:
+                try:
+                    winner = team1_name if int(team1_score) > int(team2_score) else team2_name
+                    result += f"Winner: {winner}\n"
+                except (ValueError, TypeError):
+                    pass
         
         return result
     except Exception as e:
