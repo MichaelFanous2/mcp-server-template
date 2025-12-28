@@ -222,7 +222,7 @@ class ESPNAPI:
         return result
     
     def get_game_summary(self, sport: str, league: str, event_id: str) -> Dict[str, Any]:
-        """Get detailed game summary including score, plays, etc.
+        """Get detailed game summary including score, plays, boxscore, situation, etc.
         
         Args:
             sport: e.g., 'football', 'basketball'
@@ -2577,6 +2577,73 @@ def get_espn_scores(sport: str, league: str, dates: Optional[str] = None, week: 
                     except (ValueError, TypeError):
                         pass
             
+            # Extract additional valuable data from scoreboard
+            # Linescores (quarter-by-quarter scores)
+            team1_linescores = team1_info.get("linescores", [])
+            team2_linescores = team2_info.get("linescores", [])
+            if team1_linescores and team2_linescores:
+                result += f"  Quarter Scores:\n"
+                # Group by period
+                q1_t1 = next((q.get("displayValue", "0") for q in team1_linescores if q.get("period") == 1), "0")
+                q1_t2 = next((q.get("displayValue", "0") for q in team2_linescores if q.get("period") == 1), "0")
+                q2_t1 = next((q.get("displayValue", "0") for q in team1_linescores if q.get("period") == 2), "0")
+                q2_t2 = next((q.get("displayValue", "0") for q in team2_linescores if q.get("period") == 2), "0")
+                q3_t1 = next((q.get("displayValue", "0") for q in team1_linescores if q.get("period") == 3), "0")
+                q3_t2 = next((q.get("displayValue", "0") for q in team2_linescores if q.get("period") == 3), "0")
+                q4_t1 = next((q.get("displayValue", "0") for q in team1_linescores if q.get("period") == 4), "0")
+                q4_t2 = next((q.get("displayValue", "0") for q in team2_linescores if q.get("period") == 4), "0")
+                
+                if q1_t1 != "0" or q1_t2 != "0":
+                    result += f"    Q1: {team1_name} {q1_t1} - {team2_name} {q1_t2}\n"
+                if q2_t1 != "0" or q2_t2 != "0":
+                    result += f"    Q2: {team1_name} {q2_t1} - {team2_name} {q2_t2}\n"
+                if q3_t1 != "0" or q3_t2 != "0":
+                    result += f"    Q3: {team1_name} {q3_t1} - {team2_name} {q3_t2}\n"
+                if q4_t1 != "0" or q4_t2 != "0":
+                    result += f"    Q4: {team1_name} {q4_t1} - {team2_name} {q4_t2}\n"
+            
+            # Team leaders (top performers)
+            team1_leaders = team1_info.get("leaders", [])
+            team2_leaders = team2_info.get("leaders", [])
+            if team1_leaders or team2_leaders:
+                result += f"  Top Performers:\n"
+                # Get points leader for each team
+                for team_leaders, team_name in [(team1_leaders, team1_name), (team2_leaders, team2_name)]:
+                    if team_leaders:
+                        points_leader = next((l for l in team_leaders if l.get("name") == "points"), None)
+                        if points_leader and points_leader.get("leaders"):
+                            leader_info = points_leader["leaders"][0]
+                            athlete = leader_info.get("athlete", {})
+                            player_name = athlete.get("displayName") or athlete.get("shortName", "N/A")
+                            points = leader_info.get("displayValue", "0")
+                            result += f"    {team_name}: {player_name} ({points} pts)\n"
+            
+            # Team records
+            team1_records = team1_info.get("records", [])
+            team2_records = team2_info.get("records", [])
+            if team1_records or team2_records:
+                overall1 = next((r.get("summary", "") for r in team1_records if r.get("name") == "overall"), "")
+                overall2 = next((r.get("summary", "") for r in team2_records if r.get("name") == "overall"), "")
+                if overall1 or overall2:
+                    result += f"  Records: {team1_name} {overall1} | {team2_name} {overall2}\n"
+            
+            # Game situation (if available)
+            situation = comp.get("situation", {})
+            if situation:
+                down = situation.get("down")
+                distance = situation.get("distance")
+                yard_line = situation.get("yardLine")
+                if down and distance:
+                    result += f"  Situation: {down} & {distance}"
+                    if yard_line:
+                        result += f" at {yard_line}"
+                    result += "\n"
+            
+            # Notes (injuries, game notes)
+            notes = comp.get("notes", [])
+            if notes:
+                result += f"  Notes: {len(notes)} note(s) available\n"
+            
             result += "\n"
         
         return result
@@ -2675,6 +2742,72 @@ def get_espn_game_score(sport: str, league: str, team1: str, team2: str, dates: 
                             result += f"Winner: {team2_name}\n"
                     except (ValueError, TypeError):
                         pass
+            
+            # Extract additional valuable data
+            event_id = event.get("id")
+            
+            # Quarter-by-quarter scores
+            team1_linescores = team1_info.get("linescores", [])
+            team2_linescores = team2_info.get("linescores", [])
+            if team1_linescores and team2_linescores:
+                result += f"\nQuarter Scores:\n"
+                for period_num in [1, 2, 3, 4]:
+                    q1 = next((q.get("displayValue", "0") for q in team1_linescores if q.get("period") == period_num), "0")
+                    q2 = next((q.get("displayValue", "0") for q in team2_linescores if q.get("period") == period_num), "0")
+                    if q1 != "0" or q2 != "0":
+                        result += f"  Q{period_num}: {team1_name} {q1} - {team2_name} {q2}\n"
+            
+            # Top performers
+            team1_leaders = team1_info.get("leaders", [])
+            team2_leaders = team2_info.get("leaders", [])
+            if team1_leaders or team2_leaders:
+                result += f"\nTop Performers:\n"
+                for team_leaders, team_name in [(team1_leaders, team1_name), (team2_leaders, team2_name)]:
+                    if team_leaders:
+                        points_leader = next((l for l in team_leaders if l.get("name") == "points"), None)
+                        if points_leader and points_leader.get("leaders"):
+                            leader_info = points_leader["leaders"][0]
+                            athlete = leader_info.get("athlete", {})
+                            player_name = athlete.get("displayName") or athlete.get("shortName", "N/A")
+                            points = leader_info.get("displayValue", "0")
+                            result += f"  {team_name}: {player_name} ({points} pts)\n"
+            
+            # Team records
+            team1_records = team1_info.get("records", [])
+            team2_records = team2_info.get("records", [])
+            if team1_records or team2_records:
+                overall1 = next((r.get("summary", "") for r in team1_records if r.get("name") == "overall"), "")
+                overall2 = next((r.get("summary", "") for r in team2_records if r.get("name") == "overall"), "")
+                if overall1 or overall2:
+                    result += f"\nRecords: {team1_name} {overall1} | {team2_name} {overall2}\n"
+            
+            # Try to get game summary for recent plays
+            if event_id:
+                try:
+                    summary = espn_api.get_game_summary(sport, league, event_id)
+                    
+                    # Recent plays
+                    plays = summary.get("plays", [])
+                    if plays:
+                        result += f"\nRecent Plays (last 3):\n"
+                        for play in plays[-3:]:
+                            text = play.get("text", "")
+                            period_obj = play.get("period", {})
+                            period_display = period_obj.get("displayValue", "")
+                            clock_obj = play.get("clock", {})
+                            clock_display = clock_obj.get("displayValue", "")
+                            if text:
+                                result += f"  [{period_display} {clock_display}] {text}\n"
+                    
+                    # Win probability (if available)
+                    winprob = summary.get("winprobability", [])
+                    if winprob:
+                        latest = winprob[-1]
+                        home_win_prob = latest.get("homeWinPercentage", 0)
+                        if home_win_prob:
+                            result += f"\nWin Probability: {team1_name} {home_win_prob:.1f}% | {team2_name} {100-home_win_prob:.1f}%\n"
+                except Exception as e:
+                    logger.warning(f"Could not fetch game summary for detailed plays: {e}")
         
         return result
     except Exception as e:
