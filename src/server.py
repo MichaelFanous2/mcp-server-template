@@ -2067,7 +2067,7 @@ def get_kalshi_recent_insights(limit: int = 10) -> str:
     return result
 
 
-@mcp.tool(description="Find interesting Kalshi markets right now and generate AI insights")
+@mcp.tool(description="Find interesting Kalshi markets right now and generate AI insights. Use this when user asks about 'live games', 'what's happening', 'interesting markets', or 'best opportunities'")
 def find_interesting_kalshi_markets(limit: int = 5, search_query: str = "") -> str:
     """Find interesting markets based on liquidity and activity, then generate AI insights for them."""
     logger.info(f"[MCP TOOL] find_interesting_kalshi_markets called - limit: {limit}, search_query: '{search_query}'")
@@ -2398,7 +2398,7 @@ def create_parallel_monitor(name: str, urls: str, objective: str, monitor_interv
     return f"Created monitor '{name}' (ID: {monitor_id}) for {len(url_list)} URL(s). Will check every {monitor_interval}s."
 
 
-@mcp.tool(description="Set up Kalshi calendar monitoring to get live game alerts with alpha insights. Monitor interval is in seconds (e.g., 300 for 5 minutes).")
+@mcp.tool(description="Set up Kalshi calendar monitoring to get live game alerts with alpha insights. Use this when user wants to monitor live games automatically. Monitor interval is in seconds (e.g., 300 for 5 minutes).")
 def setup_kalshi_calendar_monitor(monitor_interval: int) -> str:
     """Set up automatic monitoring of Kalshi calendar page for live games. Monitor interval is in seconds."""
     logger.info(f"[MCP TOOL] setup_kalshi_calendar_monitor called - interval: {monitor_interval}s")
