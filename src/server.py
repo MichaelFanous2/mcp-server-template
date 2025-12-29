@@ -340,68 +340,45 @@ class SlackAPI:
         channels = result.get("channels", [])
         return [{"id": ch["id"], "name": ch.get("name", "unknown")} for ch in channels]
     
-    def get_messages(self, channel_id: str, oldest: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Fetch new messages from a channel.
+    def get_latest_message(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Get the latest message from a channel.
         
         Args:
             channel_id: Slack channel ID
-            oldest: Timestamp of oldest message to fetch (exclusive). If None, fetches recent messages.
         
         Returns:
-            List of message dicts, sorted by timestamp (oldest first)
+            Latest message dict, or None if channel is empty
         """
         url = f"{self.BASE_URL}/conversations.history"
         params = {
             "channel": channel_id,
-            "limit": 100
+            "limit": 1  # Only need the latest message
         }
         
-        if oldest:
-            params["oldest"] = oldest
+        logger.info(f"[API CALL] Slack API - GET {url}, channel: {channel_id}, limit: 1")
+        response = self.session.get(url, params=params, timeout=10)
         
-        all_messages = []
+        # Handle rate limiting
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 60))
+            logger.warning(f"[SLACK] Rate limited, waiting {retry_after}s")
+            time.sleep(retry_after)
+            return None
         
-        while True:
-            logger.info(f"[API CALL] Slack API - GET {url}, channel: {channel_id}, oldest: {oldest}")
-            response = self.session.get(url, params=params, timeout=10)
-            
-            # Handle rate limiting
-            if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After", 60))
-                logger.warning(f"[SLACK] Rate limited, waiting {retry_after}s")
-                time.sleep(retry_after)
-                continue
-            
-            response.raise_for_status()
-            result = response.json()
-            logger.info(f"[API CALL] Slack API response - GET {url} - Status: {response.status_code}")
-            
-            if not result.get("ok"):
-                error = result.get("error", "unknown")
-                logger.error(f"[SLACK] API error: {error}")
-                break
-            
-            messages = result.get("messages", [])
-            if not messages:
-                break
-            
-            all_messages.extend(messages)
-            
-            # Check for pagination
-            has_more = result.get("has_more", False)
-            if not has_more:
-                break
-            
-            # Get cursor for next page
-            next_cursor = result.get("response_metadata", {}).get("next_cursor")
-            if not next_cursor:
-                break
-            
-            params["cursor"] = next_cursor
+        response.raise_for_status()
+        result = response.json()
+        logger.info(f"[API CALL] Slack API response - GET {url} - Status: {response.status_code}")
         
-        # Sort by timestamp (oldest first)
-        all_messages.sort(key=lambda m: float(m.get("ts", "0")))
-        return all_messages
+        if not result.get("ok"):
+            error = result.get("error", "unknown")
+            logger.error(f"[SLACK] API error: {error}")
+            return None
+        
+        messages = result.get("messages", [])
+        if not messages:
+            return None
+        
+        return messages[0]  # Return the latest (first) message
 
 
 slack_api = None
@@ -1840,36 +1817,41 @@ def slack_monitor_loop():
                 channel_name = channel["name"]
                 
                 try:
+                    # Get the latest message in this channel
+                    latest_msg = slack_api.get_latest_message(channel_id)
+                    
+                    if not latest_msg:
+                        continue
+                    
+                    latest_ts = latest_msg.get("ts")
+                    if not latest_ts:
+                        continue
+                    
                     # Get last seen timestamp for this channel
                     last_ts = SLACK_LAST_TS_SEEN.get(channel_id)
                     
-                    # Fetch new messages (exclusive of oldest timestamp)
-                    messages = slack_api.get_messages(channel_id, oldest=last_ts)
-                    
-                    if not messages:
+                    # If this is the same message we saw last time, skip it
+                    if last_ts == latest_ts:
                         continue
                     
-                    logger.info(f"[SLACK] Found {len(messages)} new message(s) in #{channel_name}")
+                    # New message! Process it
+                    logger.info(f"[SLACK] New message in #{channel_name} (ts: {latest_ts})")
                     
-                    # Process each message
-                    for msg in messages:
-                        # Normalize message
-                        event = normalize_slack_message(msg, channel_id, channel_name)
-                        
-                        if not event:
-                            # Skip bot/system messages
-                            continue
-                        
-                        # Send to Poke for judgment
-                        # Poke will decide whether to notify Michael or not
-                        # If important, Poke will text Michael. If not, Poke will not respond.
-                        send_to_poke(event)
+                    # Normalize message
+                    event = normalize_slack_message(latest_msg, channel_id, channel_name)
                     
-                    # Update last seen timestamp (use the latest message timestamp)
-                    if messages:
-                        latest_ts = messages[-1].get("ts")
-                        if latest_ts:
-                            SLACK_LAST_TS_SEEN[channel_id] = latest_ts
+                    if not event:
+                        # Skip bot/system messages, but still update timestamp
+                        SLACK_LAST_TS_SEEN[channel_id] = latest_ts
+                        continue
+                    
+                    # Send to Poke for judgment
+                    # Poke will decide whether to notify Michael or not
+                    # If important, Poke will text Michael. If not, Poke will not respond.
+                    send_to_poke(event)
+                    
+                    # Update last seen timestamp
+                    SLACK_LAST_TS_SEEN[channel_id] = latest_ts
                 
                 except Exception as e:
                     logger.error(f"[SLACK] Error processing channel {channel_name}: {e}")
