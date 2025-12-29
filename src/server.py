@@ -393,9 +393,13 @@ espn_api = ESPNAPI()
 
 scheduler = BackgroundScheduler()
 
+# Configure logging to output to stdout (Render captures this)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()  # Explicitly output to stdout
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -4174,6 +4178,10 @@ async def twilio_audio(request: Request):
     if not p.exists():
         return PlainTextResponse("not found", status_code=404)
     return Response(p.read_bytes(), media_type="audio/mpeg")
+
+
+# Logs are automatically captured by Render from stdout/stderr
+# All logging goes to stdout which Render displays in their log viewer
 
 
 # =========================
