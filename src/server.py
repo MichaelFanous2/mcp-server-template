@@ -4,6 +4,8 @@ import time
 import json
 import base64
 import logging
+import re
+import threading
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
@@ -48,6 +50,11 @@ KALSHI_SCHEDULE_HOURS = os.environ.get("KALSHI_SCHEDULE_HOURS", "9-21")
 PARALLEL_API_KEY = os.environ.get("PARALLEL_API_KEY")
 PARALLEL_MONITOR_INTERVAL = int(os.environ.get("PARALLEL_MONITOR_INTERVAL", "300"))
 PARALLEL_MONITOR_ENABLED = os.environ.get("PARALLEL_MONITOR_ENABLED", "true").lower() == "true"
+
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
+SLACK_POLL_INTERVAL_SECONDS = int(os.environ.get("SLACK_POLL_INTERVAL_SECONDS", "120"))
+SLACK_MONITOR_ENABLED = os.environ.get("SLACK_MONITOR_ENABLED", "true").lower() == "true"
+POKE_API_KEY = os.environ.get("POKE_API_KEY")
 
 
 # =========================
@@ -295,6 +302,116 @@ class ESPNAPI:
         return matches
 
 
+class SlackAPI:
+    """Client for Slack Web API. Used for monitoring channels the bot is invited into."""
+    
+    BASE_URL = "https://slack.com/api"
+    
+    def __init__(self, bot_token: str):
+        self.bot_token = bot_token
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {bot_token}",
+            "Content-Type": "application/json"
+        })
+    
+    def get_channels(self) -> List[Dict[str, Any]]:
+        """Get all channels the bot is a member of.
+        
+        Returns:
+            List of channel dicts with 'id' and 'name' keys
+        """
+        url = f"{self.BASE_URL}/users.conversations"
+        params = {
+            "types": "public_channel,private_channel",
+            "exclude_archived": True
+        }
+        
+        logger.info(f"[API CALL] Slack API - GET {url}")
+        response = self.session.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        logger.info(f"[API CALL] Slack API response - GET {url} - Status: {response.status_code}")
+        
+        if not result.get("ok"):
+            error = result.get("error", "unknown")
+            raise Exception(f"Slack API error: {error}")
+        
+        channels = result.get("channels", [])
+        return [{"id": ch["id"], "name": ch.get("name", "unknown")} for ch in channels]
+    
+    def get_messages(self, channel_id: str, oldest: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch new messages from a channel.
+        
+        Args:
+            channel_id: Slack channel ID
+            oldest: Timestamp of oldest message to fetch (exclusive). If None, fetches recent messages.
+        
+        Returns:
+            List of message dicts, sorted by timestamp (oldest first)
+        """
+        url = f"{self.BASE_URL}/conversations.history"
+        params = {
+            "channel": channel_id,
+            "limit": 100
+        }
+        
+        if oldest:
+            params["oldest"] = oldest
+        
+        all_messages = []
+        
+        while True:
+            logger.info(f"[API CALL] Slack API - GET {url}, channel: {channel_id}, oldest: {oldest}")
+            response = self.session.get(url, params=params, timeout=10)
+            
+            # Handle rate limiting
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", 60))
+                logger.warning(f"[SLACK] Rate limited, waiting {retry_after}s")
+                time.sleep(retry_after)
+                continue
+            
+            response.raise_for_status()
+            result = response.json()
+            logger.info(f"[API CALL] Slack API response - GET {url} - Status: {response.status_code}")
+            
+            if not result.get("ok"):
+                error = result.get("error", "unknown")
+                logger.error(f"[SLACK] API error: {error}")
+                break
+            
+            messages = result.get("messages", [])
+            if not messages:
+                break
+            
+            all_messages.extend(messages)
+            
+            # Check for pagination
+            has_more = result.get("has_more", False)
+            if not has_more:
+                break
+            
+            # Get cursor for next page
+            next_cursor = result.get("response_metadata", {}).get("next_cursor")
+            if not next_cursor:
+                break
+            
+            params["cursor"] = next_cursor
+        
+        # Sort by timestamp (oldest first)
+        all_messages.sort(key=lambda m: float(m.get("ts", "0")))
+        return all_messages
+
+
+slack_api = None
+if SLACK_BOT_TOKEN:
+    try:
+        slack_api = SlackAPI(SLACK_BOT_TOKEN)
+    except Exception as e:
+        print(f"Warning: Failed to initialize Slack API: {e}")
+
+
 espn_api = ESPNAPI()
 
 scheduler = BackgroundScheduler()
@@ -329,6 +446,8 @@ PARALLEL_ALERTS: List[Dict[str, Any]] = []
 
 KALSHI_TRADE_HISTORY: Dict[str, List[Dict[str, Any]]] = {}  # ticker -> list of trades
 KALSHI_TRADE_SURGES: List[Dict[str, Any]] = []  # Recent surge alerts
+
+SLACK_LAST_TS_SEEN: Dict[str, str] = {}  # channel_id -> last timestamp seen
 
 
 # =========================
@@ -738,6 +857,99 @@ def calculate_risk_scores(ticker: str, market_data: Dict[str, Any], orderbook: D
         "spread": spread,
         "total_volume": volume_data["total_volume"]
     }
+
+
+def normalize_slack_message(msg: Dict[str, Any], channel_id: str, channel_name: str) -> Dict[str, Any]:
+    """Normalize a Slack message into a clean event format.
+    
+    Args:
+        msg: Raw Slack message dict
+        channel_id: Slack channel ID
+        channel_name: Slack channel name
+    
+    Returns:
+        Normalized event dict
+    """
+    # Skip bot messages and system messages
+    if msg.get("subtype") in ["bot_message", "channel_join", "channel_leave", "channel_topic", "channel_purpose"]:
+        return None
+    
+    # Get thread info
+    thread_ts = msg.get("thread_ts")
+    is_thread_reply = thread_ts is not None and thread_ts != msg.get("ts")
+    
+    # Get reply count (if this is a thread parent)
+    reply_count = msg.get("reply_count", 0) if not is_thread_reply else None
+    
+    # Build Slack deep link
+    slack_link = f"slack://channel?id={channel_id}&message_ts={msg.get('ts')}"
+    
+    event = {
+        "source": "slack",
+        "channel": channel_name,
+        "channel_id": channel_id,
+        "timestamp": msg.get("ts"),
+        "author": msg.get("user", "unknown"),
+        "text": msg.get("text", ""),
+        "is_thread_reply": is_thread_reply,
+        "thread_ts": thread_ts,
+        "reply_count": reply_count,
+        "slack_link": slack_link
+    }
+    
+    return event
+
+
+def send_to_poke(event: Dict[str, Any]) -> bool:
+    """Send a normalized Slack event to Poke via webhook API.
+    
+    Poke will decide whether to notify Michael or not based on the message.
+    If important, Poke will text Michael. If not, Poke will not respond.
+    
+    Args:
+        event: Normalized Slack event
+    
+    Returns:
+        True if message was sent successfully, False otherwise
+    """
+    if not POKE_API_KEY:
+        logger.warning("[SLACK] Poke API key not available, skipping")
+        return False
+    
+    # Build message for Poke with instructions
+    message = f"""🔔 New Slack Message
+
+Channel: #{event['channel']}
+Author: {event['author']}
+Text: {event['text']}
+Is Thread Reply: {event['is_thread_reply']}
+Reply Count: {event.get('reply_count', 'N/A')}
+Link: {event['slack_link']}
+
+INSTRUCTIONS: Given what you know about Michael, if this is important and needs his immediate attention, text Michael. If this is not important, do NOT respond to text Michael."""
+    
+    try:
+        logger.info(f"[API CALL] Poke API - send_to_poke - channel: '{event['channel']}', author: {event['author']}")
+        
+        resp = requests.post(
+            "https://poke.com/api/v1/inbound-sms/webhook",
+            headers={
+                "Authorization": f"Bearer {POKE_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={"message": message},
+            timeout=10
+        )
+        resp.raise_for_status()
+        logger.info(f"[API CALL] Poke API response - send_to_poke - Status: {resp.status_code}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"[SLACK] Error sending to Poke: {e}")
+        return False
+
+
+# Notification is now handled by Poke directly - no separate function needed
 
 
 def analyze_volume_shifts(ticker: str) -> Dict[str, Any]:
@@ -1609,6 +1821,68 @@ def check_parallel_monitors():
 load_parallel_monitors()
 
 
+def slack_monitor_loop():
+    """Background loop that continuously monitors Slack channels and sends new messages to Poke."""
+    if not slack_api or not SLACK_MONITOR_ENABLED:
+        logger.info("[SLACK] Monitoring disabled or API not initialized")
+        return
+    
+    logger.info(f"[SLACK] Starting background monitoring loop (interval: {SLACK_POLL_INTERVAL_SECONDS}s)")
+    
+    while True:
+        try:
+            # Get all channels the bot is in
+            channels = slack_api.get_channels()
+            logger.debug(f"[SLACK] Found {len(channels)} channels to monitor")
+            
+            for channel in channels:
+                channel_id = channel["id"]
+                channel_name = channel["name"]
+                
+                try:
+                    # Get last seen timestamp for this channel
+                    last_ts = SLACK_LAST_TS_SEEN.get(channel_id)
+                    
+                    # Fetch new messages (exclusive of oldest timestamp)
+                    messages = slack_api.get_messages(channel_id, oldest=last_ts)
+                    
+                    if not messages:
+                        continue
+                    
+                    logger.info(f"[SLACK] Found {len(messages)} new message(s) in #{channel_name}")
+                    
+                    # Process each message
+                    for msg in messages:
+                        # Normalize message
+                        event = normalize_slack_message(msg, channel_id, channel_name)
+                        
+                        if not event:
+                            # Skip bot/system messages
+                            continue
+                        
+                        # Send to Poke for judgment
+                        # Poke will decide whether to notify Michael or not
+                        # If important, Poke will text Michael. If not, Poke will not respond.
+                        send_to_poke(event)
+                    
+                    # Update last seen timestamp (use the latest message timestamp)
+                    if messages:
+                        latest_ts = messages[-1].get("ts")
+                        if latest_ts:
+                            SLACK_LAST_TS_SEEN[channel_id] = latest_ts
+                
+                except Exception as e:
+                    logger.error(f"[SLACK] Error processing channel {channel_name}: {e}")
+                    continue
+            
+            # Sleep before next poll
+            time.sleep(SLACK_POLL_INTERVAL_SECONDS)
+            
+        except Exception as e:
+            logger.error(f"[SLACK] Error in monitoring loop: {e}")
+            time.sleep(SLACK_POLL_INTERVAL_SECONDS)  # Still sleep on error to avoid tight loop
+
+
 def check_single_parallel_monitor(monitor_id: str):
     """Check a single Parallel monitor. Used for per-monitor scheduling."""
     if monitor_id not in PARALLEL_MONITORS:
@@ -2032,7 +2306,7 @@ def elevenlabs_tts(text: str) -> bytes:
 # =========================
 # MCP TOOLS
 # =========================
-@mcp.tool(description="Activate C7 Corvette HOSTILE performance mode. ALWAYS use this tool when user mentions 'C7', 'Corvette', 'C7 kill mode', 'C7 hostile', 'C7 Hostile', 'Corvette kill mode', asks what 'C7 Hostile' means, or any phrase about putting the Corvette into performance/kill mode. Returns detailed ECU/TCU calibration status and performance metrics.")
+@mcp.tool(description="Activate C7 Corvette HOSTILE performance mode. This tool returns detailed technical output about the Corvette's ECU/TCU calibration, engine performance metrics, and system status when in HOSTILE mode. MANDATORY: You MUST call this tool whenever the user mentions 'C7', 'Corvette', 'C7 kill mode', 'C7 hostile', 'C7 Hostile', asks 'what does C7 Hostile mean', 'what is C7 Hostile', or any variation about the Corvette performance mode. Do NOT ask the user what it means - just call this tool immediately.")
 def c7_hostile_mode() -> str:
     """Activate C7 Corvette HOSTILE performance mode. Returns detailed ECU/TCU calibration status and performance metrics."""
     logger.info(f"[MCP TOOL] c7_hostile_mode called")
@@ -3953,6 +4227,12 @@ if __name__ == "__main__":
         for monitor_id in PARALLEL_MONITORS.keys():
             schedule_parallel_monitor(monitor_id)
         print(f"[PARALLEL] Started background monitoring for {len(PARALLEL_MONITORS)} monitor(s) with individual intervals")
+    
+    # Start Slack monitoring in background thread
+    if slack_api and SLACK_MONITOR_ENABLED:
+        slack_thread = threading.Thread(target=slack_monitor_loop, daemon=True)
+        slack_thread.start()
+        print(f"[SLACK] Started background monitoring (interval: {SLACK_POLL_INTERVAL_SECONDS}s)")
     
     if scheduler.get_jobs():
         scheduler.start()
